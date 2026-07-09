@@ -1,0 +1,223 @@
+import type { TestResult, WordResult } from "../types";
+import { LANGS } from "../wordlist";
+import { el, fmt } from "./common";
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+type ResultHandlers = {
+  onRestart: () => void;
+  onPracticeWords: (words: string[]) => void;
+};
+
+function wordWpm(w: WordResult): number | null {
+  if (w.timeMs === null || w.timeMs <= 0) return null;
+  return (w.text.length / 5) / (w.timeMs / 60000);
+}
+
+export function renderResults(
+  root: HTMLElement,
+  result: TestResult,
+  handlers: ResultHandlers
+): void {
+  root.innerHTML = "";
+
+  // --- tuiles ---
+  const tiles = el("div", "result-tiles");
+  const mk = (label: string, value: string, unit: string, hero = false) => {
+    const tile = el("div", hero ? "tile hero" : "tile");
+    tile.append(el("div", "label", label));
+    const v = el("div", "value", value);
+    if (unit) v.append(el("span", "unit", unit));
+    tile.append(v);
+    return tile;
+  };
+  tiles.append(
+    mk("wpm", fmt(result.wpm), "", true),
+    mk("précision", fmt(result.accuracy * 100), "%"),
+    mk("brut", fmt(result.rawWpm), "wpm"),
+    mk("durée", fmt(result.durationMs / 1000, 1), "s"),
+    mk(
+      "mode",
+      result.mode === "practice" ? "entraînement" : "normal",
+      "",
+    )
+  );
+  const langTile = mk("langue", LANGS[result.lang].label, "");
+  tiles.append(langTile);
+  root.append(tiles);
+
+  // --- courbe wpm ---
+  if (result.wpmSeries.length > 1) {
+    root.append(buildChart(result));
+  }
+
+  // --- mots du test ---
+  const wordsTitle = el("h3", "section-title", "Mots du test");
+  root.append(wordsTitle);
+  const chips = el("div", "result-words");
+  const toReview = new Set<string>();
+  for (const w of result.words) {
+    const chip = el("span", "rw", w.text);
+    const wpm = wordWpm(w);
+    const parts: string[] = [];
+    if (wpm !== null) parts.push(`${fmt(wpm)} wpm`);
+    parts.push(w.errors === 0 ? "aucune erreur" : `${w.errors} erreur(s)`);
+    chip.title = parts.join(" · ");
+    if (w.errors > 0) {
+      chip.classList.add("err");
+      toReview.add(w.text);
+    }
+    if (wpm !== null) {
+      if (wpm < result.wpm * 0.7) {
+        chip.classList.add("slow");
+        toReview.add(w.text);
+      } else if (wpm > result.wpm * 1.3) {
+        chip.classList.add("fast");
+      }
+    }
+    chips.append(chip);
+  }
+  root.append(chips);
+
+  // --- actions ---
+  const btns = el("div", "btn-row");
+  const restart = el("button", "btn primary", "Recommencer (Tab)");
+  restart.addEventListener("click", handlers.onRestart);
+  btns.append(restart);
+  if (toReview.size > 0) {
+    const practice = el(
+      "button",
+      "btn",
+      `⚑ S'entraîner sur ces ${toReview.size} mot(s)`
+    );
+    practice.addEventListener("click", () =>
+      handlers.onPracticeWords([...toReview])
+    );
+    btns.append(practice);
+  }
+  root.append(btns);
+}
+
+/** Courbe WPM net par seconde — série unique, crosshair + tooltip au survol */
+function buildChart(result: TestResult): HTMLElement {
+  const card = el("div", "chart-card");
+  card.append(el("h3", undefined, "WPM au fil du test"));
+
+  const W = 700;
+  const H = 200;
+  const M = { top: 10, right: 12, bottom: 24, left: 40 };
+  const iw = W - M.left - M.right;
+  const ih = H - M.top - M.bottom;
+
+  const series = result.wpmSeries;
+  const maxT = series[series.length - 1]?.t ?? 1;
+  const maxWpm = Math.max(10, ...series.map((p) => p.wpm));
+  const yMax = Math.ceil((maxWpm * 1.1) / 10) * 10;
+
+  const x = (t: number) => M.left + (t / maxT) * iw;
+  const y = (wpm: number) => M.top + ih - (wpm / yMax) * ih;
+
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.style.width = "100%";
+  svg.style.display = "block";
+
+  const addLine = (
+    x1: number, y1: number, x2: number, y2: number, stroke: string
+  ) => {
+    const line = document.createElementNS(SVG_NS, "line");
+    line.setAttribute("x1", String(x1));
+    line.setAttribute("y1", String(y1));
+    line.setAttribute("x2", String(x2));
+    line.setAttribute("y2", String(y2));
+    line.setAttribute("stroke", stroke);
+    line.setAttribute("stroke-width", "1");
+    svg.append(line);
+    return line;
+  };
+  const addText = (tx: number, ty: number, text: string, anchor: string) => {
+    const node = document.createElementNS(SVG_NS, "text");
+    node.setAttribute("x", String(tx));
+    node.setAttribute("y", String(ty));
+    node.setAttribute("fill", "#898781");
+    node.setAttribute("font-size", "11");
+    node.setAttribute("text-anchor", anchor);
+    node.textContent = text;
+    svg.append(node);
+  };
+
+  // grille horizontale + graduations y
+  const ySteps = 4;
+  for (let i = 0; i <= ySteps; i++) {
+    const value = (yMax / ySteps) * i;
+    const gy = y(value);
+    addLine(M.left, gy, W - M.right, gy, i === 0 ? "#383835" : "#2c2c2a");
+    addText(M.left - 8, gy + 4, fmt(value), "end");
+  }
+  // graduations x (secondes)
+  const xTicks = Math.min(8, Math.floor(maxT));
+  for (let i = 0; i <= xTicks; i++) {
+    const t = (maxT / xTicks) * i;
+    addText(x(t), H - 6, fmt(t) + "s", "middle");
+  }
+
+  // ligne de la série
+  const path = document.createElementNS(SVG_NS, "path");
+  path.setAttribute(
+    "d",
+    series
+      .map((p, i) => `${i === 0 ? "M" : "L"}${x(p.t)},${y(p.wpm)}`)
+      .join(" ")
+  );
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", "#3987e5");
+  path.setAttribute("stroke-width", "2");
+  path.setAttribute("stroke-linejoin", "round");
+  svg.append(path);
+
+  // --- survol : crosshair + tooltip ---
+  const crosshair = addLine(0, M.top, 0, M.top + ih, "#898781");
+  crosshair.setAttribute("visibility", "hidden");
+  const dot = document.createElementNS(SVG_NS, "circle");
+  dot.setAttribute("r", "4");
+  dot.setAttribute("fill", "#3987e5");
+  dot.setAttribute("stroke", "#1a1a19");
+  dot.setAttribute("stroke-width", "2");
+  dot.setAttribute("visibility", "hidden");
+  svg.append(dot);
+
+  const tooltip = el("div", "chart-tooltip");
+  tooltip.hidden = true;
+  card.append(svg, tooltip);
+
+  svg.addEventListener("mousemove", (e) => {
+    const rect = svg.getBoundingClientRect();
+    const scale = W / rect.width;
+    const mx = (e.clientX - rect.left) * scale;
+    const t = ((mx - M.left) / iw) * maxT;
+    let nearest = series[0];
+    if (!nearest) return;
+    for (const p of series) {
+      if (Math.abs(p.t - t) < Math.abs(nearest.t - t)) nearest = p;
+    }
+    const px = x(nearest.t);
+    const py = y(nearest.wpm);
+    crosshair.setAttribute("x1", String(px));
+    crosshair.setAttribute("x2", String(px));
+    crosshair.setAttribute("visibility", "visible");
+    dot.setAttribute("cx", String(px));
+    dot.setAttribute("cy", String(py));
+    dot.setAttribute("visibility", "visible");
+    tooltip.hidden = false;
+    tooltip.textContent = `${fmt(nearest.t)}s — ${fmt(nearest.wpm)} wpm`;
+    tooltip.style.left = `${px / scale}px`;
+    tooltip.style.top = `${py / scale + svg.getBoundingClientRect().top - card.getBoundingClientRect().top}px`;
+  });
+  svg.addEventListener("mouseleave", () => {
+    crosshair.setAttribute("visibility", "hidden");
+    dot.setAttribute("visibility", "hidden");
+    tooltip.hidden = true;
+  });
+
+  return card;
+}
