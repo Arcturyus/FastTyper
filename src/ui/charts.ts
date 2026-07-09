@@ -25,19 +25,19 @@ import { hexbin as d3hexbin } from "d3-hexbin";
 const NS = "http://www.w3.org/2000/svg";
 
 // ---- palette (variables du thème) -----------------------------------------
-const INK = "#eceae6";
-const INK_2 = "#c3c2b7";
-const MUTED = "#898781";
-const GRID = "#2c2c2a";
-const BASELINE = "#383835";
-const SURFACE = "#1a1a19";
-export const ACCENT = "#3987e5";
-export const PACE = "#9085e9";
+const INK = "#f2e6c4";
+const INK_2 = "#cbba8c";
+const MUTED = "#8a7d5c";
+const GRID = "#2b2619";
+const BASELINE = "#3a3320";
+const SURFACE = "#1a160e";
+export const ACCENT = "#e6c15a";
+export const PACE = "#cfc7ad";
 export const STATUS = {
-  good: "#0ca30c",
-  warning: "#fab219",
-  serious: "#ec835a",
-  critical: "#d03b3b",
+  good: "#9bb04e",
+  warning: "#e0a83c",
+  serious: "#d47a3e",
+  critical: "#c9482f",
 };
 
 const numFmt = (n: number, d = 0) =>
@@ -46,7 +46,7 @@ const numFmt = (n: number, d = 0) =>
 /** Rampe séquentielle : t (0..1) → du fond sombre vers la teinte forte. */
 export function ramp(t: number, hue: string): string {
   const c = Math.max(0, Math.min(1, t));
-  return interpolateRgb("#181712", hue)(0.1 + 0.9 * c);
+  return interpolateRgb("#171206", hue)(0.1 + 0.9 * c);
 }
 
 // ---- carte + tooltip partagés ---------------------------------------------
@@ -455,7 +455,7 @@ export function heatmap(opts: {
   svg.append("g").selectAll("rect").data(cellsData).join("rect")
     .attr("x", (d) => xs(d.col)! + 1).attr("y", (d) => ys(d.r)! + 1)
     .attr("width", cell - 2).attr("height", cell - 2).attr("rx", 3)
-    .attr("fill", (d) => d.v === null ? "#161615" : ramp((d.v - vMin) / span, opts.hue))
+    .attr("fill", (d) => d.v === null ? "#161310" : ramp((d.v - vMin) / span, opts.hue))
     .style("cursor", (d) => d.v === null ? "default" : "pointer")
     .on("mousemove", function (event, d) {
       if (d.v === null) return;
@@ -572,7 +572,7 @@ export function calendarHeatmap(opts: {
     const t = cnt === 0 ? 0 : 0.25 + 0.75 * (cnt / maxCount);
     const label = dt.toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" });
     svg.append("rect").attr("x", px).attr("y", py).attr("width", cell).attr("height", cell).attr("rx", 3)
-      .attr("fill", cnt === 0 ? "#1d1d1b" : ramp(t, hue))
+      .attr("fill", cnt === 0 ? "#1d1a12" : ramp(t, hue))
       .on("mousemove", function (event) { select(this).attr("stroke", INK); c.showTip(event, `<b>${cnt}</b> test(s)<br><span class="t-dim">${label}</span>`); })
       .on("mouseleave", function () { select(this).attr("stroke", null); c.hideTip(); });
   }

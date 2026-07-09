@@ -1,27 +1,54 @@
 :root {
-  /* surfaces & encre (palette de référence, mode sombre) */
-  --bg: #0d0d0d;
-  --surface: #1a1a19;
-  --surface-2: #232322;
-  --text: #eceae6;
-  --text-2: #c3c2b7;
-  --muted: #898781;
-  --grid: #2c2c2a;
-  --baseline: #383835;
-  --border: rgba(255, 255, 255, 0.1);
-  /* accent & série */
-  --accent: #3987e5;
-  /* statuts (mots) */
-  --status-good: #0ca30c;
-  --status-warning: #fab219;
-  --status-serious: #ec835a;
-  --status-critical: #d03b3b;
+  /* ---------- cahier à l'encre d'or (mode sombre chaud) ---------- */
+  --bg: #0f0d07;
+  --paper: #14110a;
+  --surface: #1a160e;
+  --surface-2: #241f14;
+  --text: #f2e6c4;
+  --text-2: #cbba8c;
+  --muted: #8a7d5c;
+  --grid: #2b2619;
+  --baseline: #3a3320;
+  --border: rgba(214, 178, 74, 0.2);
+
+  /* réglure du cahier + marge (feuille double collège) */
+  --rule: rgba(214, 178, 74, 0.06);
+  --rule-strong: rgba(214, 178, 74, 0.13);
+  --margin: rgba(196, 92, 58, 0.38);
+
+  /* ---------- OR brillant (accent) ---------- */
+  --gold: #e6c15a;
+  --gold-bright: #ffe6a0;
+  --gold-deep: #b8860b;
+  --accent: var(--gold);
+  --gold-glow: rgba(230, 193, 90, 0.4);
+  /* dégradé métallique animable (reflets) : bord sombre → bande lumineuse
+     centrale → bord sombre, en biais (pas parfaitement horizontal) */
+  --gold-sheen: linear-gradient(
+    108deg,
+    #8a5f07 0%,
+    #b8860b 18%,
+    #e6c15a 38%,
+    #fff7d6 50%,
+    #e6c15a 62%,
+    #b8860b 82%,
+    #8a5f07 100%
+  );
+
+  /* statuts : échelle chaude d'intensité (olive → ambre → cuivre → braise) */
+  --status-good: #9bb04e;
+  --status-warning: #e0a83c;
+  --status-serious: #d47a3e;
+  --status-critical: #c9482f;
+
   /* lettres */
-  --letter-pending: #6b6a64;
-  --letter-wrong: #e66767;
-  --letter-extra: #a94f4f;
-  /* curseur de rythme (fantôme) */
-  --pace: #9085e9;
+  --letter-pending: #5c543c;
+  --letter-wrong: #e07a52;
+  --letter-extra: #9c5a3c;
+
+  /* curseur de rythme (fantôme) : argent, contraste avec l'or */
+  --pace: #cfc7ad;
+
   --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
 }
@@ -30,16 +57,53 @@
 
 body {
   margin: 0;
-  background: var(--bg);
   color: var(--text);
   font-family: var(--sans);
   line-height: 1.5;
+  background-color: var(--bg);
+  /* halo doré en haut + réglure horizontale façon cahier */
+  background-image:
+    radial-gradient(150% 110% at 50% -25%, rgba(230, 193, 90, 0.06), transparent 55%),
+    repeating-linear-gradient(to bottom, transparent 0 31px, var(--rule) 31px 32px);
+  background-attachment: fixed;
+}
+
+/* reflet doré : la bande lumineuse balaie le texte en aller-retour fluide
+   (alternate + ease-in-out → aucun saut au rebouclage) */
+@keyframes sheen {
+  from { background-position: 0% 50%; }
+  to { background-position: 100% 50%; }
+}
+.gold-metal {
+  background: var(--gold-sheen);
+  background-size: 260% 100%;
+  background-position: 0% 50%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: sheen 5s ease-in-out infinite alternate;
 }
 
 #app {
   max-width: 960px;
   margin: 0 auto;
-  padding: 1.5rem 1rem 4rem;
+  padding: 1.5rem 1rem 4rem 3.6rem;
+  position: relative;
+  min-height: 100vh;
+}
+/* marge rouge du cahier : pseudo-élément étiré sur toute la hauteur réelle
+   de #app (top:0/bottom:0), donc jamais raccourci par un contenu court —
+   et bien à gauche du texte grâce au padding-left ci-dessus. */
+#app::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 1.1rem;
+  width: 1.5px;
+  background: var(--margin);
+  pointer-events: none;
 }
 
 /* ---------- barre du haut ---------- */
@@ -48,14 +112,42 @@ body {
   align-items: center;
   justify-content: space-between;
   margin-bottom: 2.5rem;
+  position: relative;
+  z-index: 1;
+  padding: 0.4rem 0;
+}
+/* fond opaque du header, isolé dans un pseudo-élément (évite que la
+   réglure ne traverse le logo/la nav) et estompé en dégradé vers les
+   bords pour ne pas créer un rectangle net — le masque ne porte que sur
+   ce fond, jamais sur le texte, qui reste pleinement lisible. */
+.topbar::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: var(--bg);
+  -webkit-mask-image: linear-gradient(
+    90deg,
+    transparent 0,
+    black 10%,
+    black 90%,
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    90deg,
+    transparent 0,
+    black 10%,
+    black 90%,
+    transparent 100%
+  );
 }
 .brand {
   font-family: var(--mono);
   font-size: 1.4rem;
   font-weight: 700;
-  color: var(--muted);
+  letter-spacing: 0.02em;
+  filter: drop-shadow(0 1px 6px var(--gold-glow));
 }
-.brand span { color: var(--accent); }
 nav { display: flex; gap: 0.5rem; }
 nav a {
   color: var(--muted);
@@ -63,9 +155,13 @@ nav a {
   padding: 0.35rem 0.8rem;
   border-radius: 6px;
   font-size: 0.95rem;
+  transition: color 0.15s, background 0.15s;
 }
 nav a:hover { color: var(--text); background: var(--surface); }
-nav a.active { color: var(--accent); }
+nav a.active {
+  color: var(--gold-bright);
+  text-shadow: 0 0 12px var(--gold-glow);
+}
 
 /* ---------- vue test ---------- */
 .test-controls {
@@ -89,7 +185,7 @@ nav a.active { color: var(--accent); }
   font-family: inherit;
 }
 .chip-btn:hover { color: var(--text); background: var(--surface); }
-.chip-btn.on { color: var(--accent); }
+.chip-btn.on { color: var(--gold-bright); text-shadow: 0 0 10px var(--gold-glow); }
 .chip-btn.practice-on { color: var(--status-serious); }
 select, input[type="text"], input[type="number"] {
   background: var(--surface);
@@ -100,20 +196,37 @@ select, input[type="text"], input[type="number"] {
   font-family: inherit;
   font-size: 0.9rem;
 }
+select:focus, input[type="text"]:focus, input[type="number"]:focus {
+  outline: none;
+  border-color: var(--gold);
+  box-shadow: 0 0 0 2px var(--gold-glow);
+}
 
 .live-stats {
   display: flex;
   gap: 1.5rem;
   justify-content: center;
   font-family: var(--mono);
-  color: var(--accent);
+  color: var(--gold-bright);
+  text-shadow: 0 0 12px var(--gold-glow);
   font-size: 1.1rem;
   min-height: 1.7rem;
   margin-bottom: 1rem;
 }
-.live-stats .dim { color: var(--muted); }
+.live-stats .dim { color: var(--muted); text-shadow: none; }
 
-.words-wrap { position: relative; cursor: text; }
+/* la « feuille » sur laquelle on écrit : marge rouge + réglure */
+.words-wrap {
+  position: relative;
+  cursor: text;
+  border-radius: 12px;
+  padding: 0.7rem 1.1rem;
+  background-color: var(--paper);
+  border: 1px solid var(--border);
+  box-shadow:
+    0 1px 0 rgba(255, 240, 190, 0.05) inset,
+    0 10px 40px rgba(0, 0, 0, 0.45);
+}
 
 /* curseur de rythme : tirets verticaux avançant à la vitesse moyenne cible */
 .pace-caret {
@@ -139,6 +252,13 @@ select, input[type="text"], input[type="number"] {
   height: 7.2rem;
   overflow: hidden;
   user-select: none;
+  /* réglure d'écriture : une ligne sous chaque ligne de texte, solidaire du défilement */
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0 calc(2.4rem - 1.5px),
+    var(--rule-strong) calc(2.4rem - 1.5px) 2.4rem
+  );
+  background-attachment: local;
 }
 .word {
   display: inline-block;
@@ -148,7 +268,11 @@ select, input[type="text"], input[type="number"] {
   border-bottom: 2px solid transparent;
 }
 .word .letter { color: var(--letter-pending); }
-.word .letter.correct { color: var(--text); }
+/* encre d'or : les lettres justes brillent */
+.word .letter.correct {
+  color: var(--gold);
+  text-shadow: 0 0 7px var(--gold-glow);
+}
 .word .letter.incorrect { color: var(--letter-wrong); text-decoration: underline; }
 .word .letter.extra { color: var(--letter-extra); }
 
@@ -166,18 +290,22 @@ select, input[type="text"], input[type="number"] {
   transform: translateX(-50%);
   background: radial-gradient(
     ellipse at center,
-    rgba(230, 103, 103, 0.95) 0%,
-    rgba(230, 103, 103, 0.55) 35%,
-    rgba(230, 103, 103, 0) 72%
+    rgba(224, 110, 66, 0.95) 0%,
+    rgba(224, 110, 66, 0.55) 35%,
+    rgba(224, 110, 66, 0) 72%
   );
   opacity: calc(0.22 + 0.78 * var(--seam-i, 0));
   border-radius: 40%;
   pointer-events: none;
 }
 
-/* coloration selon l'historique du mot */
-.word.w-slow { background: rgba(236, 131, 90, 0.14); }
-.word.w-fast { background: rgba(12, 163, 12, 0.10); }
+/* coloration selon l'historique du mot — échelle sur une même teinte d'or :
+   maîtrisé = or lumineux, lent = bronze profond (même teinte, intensité opposée) */
+.word.w-slow { background: rgba(150, 96, 26, 0.32); }
+.word.w-fast {
+  background: rgba(230, 193, 90, 0.16);
+  box-shadow: inset 0 0 12px rgba(255, 230, 160, 0.14);
+}
 .word.w-err { border-bottom-color: var(--status-critical); }
 
 /* caret */
@@ -189,7 +317,8 @@ select, input[type="text"], input[type="number"] {
   top: 15%;
   height: 70%;
   width: 2px;
-  background: var(--accent);
+  background: var(--gold-bright);
+  box-shadow: 0 0 8px var(--gold-glow);
   animation: blink 1s step-end infinite;
 }
 .word .letter.caret-end::after {
@@ -199,7 +328,8 @@ select, input[type="text"], input[type="number"] {
   top: 15%;
   height: 70%;
   width: 2px;
-  background: var(--accent);
+  background: var(--gold-bright);
+  box-shadow: 0 0 8px var(--gold-glow);
   animation: blink 1s step-end infinite;
 }
 .word .letter.caret-end { position: relative; }
@@ -211,10 +341,10 @@ select, input[type="text"], input[type="number"] {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(13, 13, 13, 0.75);
+  background: rgba(15, 13, 7, 0.78);
   color: var(--text-2);
   font-size: 1rem;
-  border-radius: 8px;
+  border-radius: 11px;
   backdrop-filter: blur(2px);
 }
 .focus-hint[hidden] { display: none; }
@@ -243,8 +373,8 @@ select, input[type="text"], input[type="number"] {
   border-radius: 40%;
   background: radial-gradient(
     ellipse at center,
-    rgba(230, 103, 103, 0.95) 0%,
-    rgba(230, 103, 103, 0) 72%
+    rgba(224, 110, 66, 0.95) 0%,
+    rgba(224, 110, 66, 0) 72%
   );
 }
 kbd {
@@ -254,6 +384,7 @@ kbd {
   padding: 0 0.4em;
   font-family: var(--mono);
   font-size: 0.85em;
+  color: var(--text-2);
 }
 
 .hidden-input {
@@ -278,10 +409,23 @@ kbd {
   border-radius: 10px;
   padding: 0.9rem 1.3rem;
   min-width: 120px;
+  position: relative;
+  overflow: hidden;
+}
+/* fine ligne de lumière en haut de chaque tuile */
+.tile::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--gold-glow), transparent);
 }
 .tile .label { color: var(--muted); font-size: 0.8rem; }
 .tile .value { font-size: 1.9rem; font-weight: 600; }
-.tile.hero .value { font-size: 2.8rem; color: var(--accent); }
+.tile.hero .value {
+  font-size: 2.8rem;
+  filter: drop-shadow(0 2px 10px var(--gold-glow));
+}
 .tile .unit { font-size: 0.9rem; color: var(--muted); margin-left: 0.2em; }
 
 .chart-card {
@@ -309,6 +453,7 @@ kbd {
   color: var(--text);
   white-space: nowrap;
   transform: translate(-50%, -130%);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
   z-index: 5;
 }
 
@@ -328,12 +473,15 @@ kbd {
   color: var(--text-2);
 }
 .rw.err { border-bottom-color: var(--status-critical); color: var(--letter-wrong); }
-.rw.slow { background: rgba(236, 131, 90, 0.14); }
-.rw.fast { background: rgba(12, 163, 12, 0.10); }
+.rw.slow { background: rgba(150, 96, 26, 0.32); }
+.rw.fast {
+  background: rgba(230, 193, 90, 0.16);
+  box-shadow: inset 0 0 10px rgba(255, 230, 160, 0.14);
+}
 
 .btn-row { display: flex; gap: 0.8rem; flex-wrap: wrap; }
 .btn {
-  background: var(--surface-2);
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -341,10 +489,20 @@ kbd {
   cursor: pointer;
   font-family: inherit;
   font-size: 0.95rem;
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
-.btn:hover { border-color: var(--accent); }
-.btn.primary { background: var(--accent); color: #0d0d0d; border-color: transparent; font-weight: 600; }
-.btn.danger:hover { border-color: var(--status-critical); color: var(--status-critical); }
+.btn:hover { border-color: var(--gold); box-shadow: 0 0 14px var(--gold-glow); }
+.btn.primary {
+  background: linear-gradient(180deg, #f4dd8e, #d9ad4e);
+  color: #201705;
+  border: 1px solid var(--gold-deep);
+  font-weight: 700;
+  box-shadow:
+    0 1px 0 rgba(255, 244, 200, 0.6) inset,
+    0 2px 16px var(--gold-glow);
+}
+.btn.primary:hover { box-shadow: 0 1px 0 rgba(255, 244, 200, 0.6) inset, 0 3px 22px var(--gold-glow); }
+.btn.danger:hover { border-color: var(--status-critical); color: var(--status-critical); box-shadow: 0 0 14px rgba(201, 72, 47, 0.35); }
 
 /* ---------- page stats ---------- */
 h2.page-title { font-size: 1.3rem; margin: 0 0 1.2rem; }
@@ -379,7 +537,7 @@ table.data th {
   cursor: pointer;
   user-select: none;
 }
-table.data th.sorted { color: var(--accent); }
+table.data th.sorted { color: var(--gold); }
 table.data td.num, table.data th.num { text-align: right; font-variant-numeric: tabular-nums; }
 table.data td .word-chip {
   font-family: var(--mono);
@@ -387,8 +545,8 @@ table.data td .word-chip {
   border-radius: 5px;
   border-bottom: 2px solid transparent;
 }
-table.data td .word-chip.w-slow { background: rgba(236, 131, 90, 0.14); }
-table.data td .word-chip.w-fast { background: rgba(12, 163, 12, 0.10); }
+table.data td .word-chip.w-slow { background: rgba(150, 96, 26, 0.32); }
+table.data td .word-chip.w-fast { background: rgba(230, 193, 90, 0.16); }
 table.data td .word-chip.w-err { border-bottom-color: var(--status-critical); }
 
 .two-cols {
@@ -449,7 +607,11 @@ table.data td .word-chip.w-err { border-bottom-color: var(--status-critical); }
   margin-bottom: -1px;
 }
 .tab-btn:hover { color: var(--text); }
-.tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-btn.active {
+  color: var(--gold-bright);
+  border-bottom-color: var(--gold);
+  text-shadow: 0 0 10px var(--gold-glow);
+}
 
 .tile-hint { color: var(--muted); font-size: 0.72rem; margin-top: 0.15rem; }
 .cards-row .tile { min-width: 110px; flex: 1 1 110px; }
@@ -467,7 +629,11 @@ table.data td .word-chip.w-err { border-bottom-color: var(--status-critical); }
   font-size: 0.82rem;
 }
 .pill:hover, .seg-btn:hover { color: var(--text); }
-.pill.on, .seg-btn.on { color: var(--accent); border-color: var(--accent); }
+.pill.on, .seg-btn.on {
+  color: var(--gold-bright);
+  border-color: var(--gold);
+  box-shadow: 0 0 10px var(--gold-glow);
+}
 .seg-toggle { display: flex; gap: 0.4rem; margin-bottom: 0.8rem; }
 .seg-btn { border-radius: 6px; }
 
@@ -525,7 +691,7 @@ table.data td .word-chip.w-err { border-bottom-color: var(--status-critical); }
 .bar-label { color: var(--text-2); font-size: 0.85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .bar-label.mono { font-family: var(--mono); }
 .bar-track { background: var(--surface-2); border-radius: 5px; height: 0.85rem; overflow: hidden; }
-.bar-fill { height: 100%; border-radius: 5px; min-width: 2px; transition: width 0.3s ease; }
+.bar-fill { height: 100%; border-radius: 5px; min-width: 2px; transition: width 0.3s ease; filter: saturate(1.05); }
 .bar-value { font-size: 0.82rem; color: var(--text); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .bar-sub { color: var(--muted); font-size: 0.72rem; margin-left: 0.4rem; }
 
@@ -544,5 +710,6 @@ table.data td .word-chip.w-err { border-bottom-color: var(--status-critical); }
   padding: 0.6rem 1.2rem;
   border-radius: 8px;
   font-size: 0.9rem;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
   z-index: 100;
 }

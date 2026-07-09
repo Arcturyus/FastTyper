@@ -493,7 +493,7 @@ function posSparkline(word: string, s: WordStat): SVGSVGElement | null {
     rect.setAttribute("width", String(cw - 1));
     rect.setAttribute("height", String(bh));
     rect.setAttribute("rx", "1");
-    rect.setAttribute("fill", rate > 0 ? ramp(0.3 + 0.7 * Math.min(1, rate / 0.4), STATUS.critical) : "#2a2a28");
+    rect.setAttribute("fill", rate > 0 ? ramp(0.3 + 0.7 * Math.min(1, rate / 0.4), STATUS.critical) : "#2a2617");
     svg.append(rect);
   }
   const worst = rates.indexOf(Math.max(...rates));

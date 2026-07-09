@@ -26,7 +26,7 @@ export function renderResults(
   const mk = (label: string, value: string, unit: string, hero = false) => {
     const tile = el("div", hero ? "tile hero" : "tile");
     tile.append(el("div", "label", label));
-    const v = el("div", "value", value);
+    const v = el("div", hero ? "value gold-metal" : "value", value);
     if (unit) v.append(el("span", "unit", unit));
     tile.append(v);
     return tile;
@@ -139,7 +139,7 @@ function buildChart(result: TestResult): HTMLElement {
     const node = document.createElementNS(SVG_NS, "text");
     node.setAttribute("x", String(tx));
     node.setAttribute("y", String(ty));
-    node.setAttribute("fill", "#898781");
+    node.setAttribute("fill", "#8a7d5c");
     node.setAttribute("font-size", "11");
     node.setAttribute("text-anchor", anchor);
     node.textContent = text;
@@ -151,7 +151,7 @@ function buildChart(result: TestResult): HTMLElement {
   for (let i = 0; i <= ySteps; i++) {
     const value = (yMax / ySteps) * i;
     const gy = y(value);
-    addLine(M.left, gy, W - M.right, gy, i === 0 ? "#383835" : "#2c2c2a");
+    addLine(M.left, gy, W - M.right, gy, i === 0 ? "#3a3320" : "#2b2619");
     addText(M.left - 8, gy + 4, fmt(value), "end");
   }
   // graduations x (secondes)
@@ -170,18 +170,18 @@ function buildChart(result: TestResult): HTMLElement {
       .join(" ")
   );
   path.setAttribute("fill", "none");
-  path.setAttribute("stroke", "#3987e5");
+  path.setAttribute("stroke", "#e6c15a");
   path.setAttribute("stroke-width", "2");
   path.setAttribute("stroke-linejoin", "round");
   svg.append(path);
 
   // --- survol : crosshair + tooltip ---
-  const crosshair = addLine(0, M.top, 0, M.top + ih, "#898781");
+  const crosshair = addLine(0, M.top, 0, M.top + ih, "#8a7d5c");
   crosshair.setAttribute("visibility", "hidden");
   const dot = document.createElementNS(SVG_NS, "circle");
   dot.setAttribute("r", "4");
-  dot.setAttribute("fill", "#3987e5");
-  dot.setAttribute("stroke", "#1a1a19");
+  dot.setAttribute("fill", "#e6c15a");
+  dot.setAttribute("stroke", "#1a160e");
   dot.setAttribute("stroke-width", "2");
   dot.setAttribute("visibility", "hidden");
   svg.append(dot);
