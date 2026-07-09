@@ -637,6 +637,114 @@ table.data td .word-chip.w-err { border-bottom-color: var(--status-critical); }
 .seg-toggle { display: flex; gap: 0.4rem; margin-bottom: 0.8rem; }
 .seg-btn { border-radius: 6px; }
 
+/* filtre de langues (en-tête) */
+.lang-filter {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+.lang-filter-label {
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.lang-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.lang-pill::before {
+  content: "";
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: var(--lang-dot, var(--muted));
+  opacity: 0.4;
+  transition: opacity 0.15s;
+}
+.lang-pill.on::before { opacity: 1; box-shadow: 0 0 6px var(--lang-dot); }
+
+/* cartographie interactive */
+.carto-block { margin-bottom: 1.2rem; }
+.carto-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.8rem 1.2rem;
+  padding: 0.7rem 0.9rem;
+  margin-bottom: 0.6rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.ctrl { display: flex; align-items: center; gap: 0.5rem; }
+.ctrl-label {
+  color: var(--muted);
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+.ctrl .seg-toggle { margin-bottom: 0; }
+.ctrl-slider input[type="range"] { width: 8rem; }
+.ctrl-value {
+  color: var(--gold-bright);
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  min-width: 3.2rem;
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  cursor: pointer;
+  outline: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--gold);
+  box-shadow: 0 0 8px var(--gold-glow);
+  border: none;
+}
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: none;
+  border-radius: 50%;
+  background: var(--gold);
+  box-shadow: 0 0 8px var(--gold-glow);
+}
+
+/* badge de langue (tableau) */
+.lang-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.lang-badge::before {
+  content: "";
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--lang-dot, var(--muted));
+}
+
+/* ligne surlignée depuis la cartographie */
+table.data tr.row-focus td {
+  background: var(--gold-glow);
+  box-shadow: inset 2px 0 0 var(--gold);
+}
+
 /* légende catégorielle */
 .chart-legend {
   display: flex;

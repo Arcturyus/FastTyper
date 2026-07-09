@@ -246,7 +246,7 @@ export function histogramChart(opts: {
 // ===========================================================================
 //  Nuage générique : quadrants, bulles, tendance (moindres carrés)
 // ===========================================================================
-export type ScatterPoint = { x: number; y: number; r?: number; tint?: string; tip: string };
+export type ScatterPoint = { x: number; y: number; r?: number; tint?: string; tip: string; key?: string };
 
 export function scatterChart(opts: {
   title: string;
@@ -260,6 +260,8 @@ export function scatterChart(opts: {
   hLines?: { y: number; color?: string }[];
   quadrants?: { xAt: "min" | "max"; yAt: "min" | "max"; label: string; tint: string }[];
   trendline?: boolean;
+  diagonal?: boolean; // trace la droite d'égalité y = x
+  onPick?: (p: ScatterPoint) => void; // clic sur le point le plus proche
   height?: number;
 }): HTMLElement {
   const xFormat = opts.xFormat ?? ((v) => numFmt(v));
@@ -318,6 +320,17 @@ export function scatterChart(opts: {
     }
   }
 
+  // diagonale d'égalité y = x (sur la plage commune aux deux axes)
+  if (opts.diagonal) {
+    const [xd0, xd1] = x.domain() as [number, number];
+    const [yd0, yd1] = y.domain() as [number, number];
+    const lo = Math.max(xd0, yd0), hi = Math.min(xd1, yd1);
+    if (hi > lo) {
+      svg.append("line").attr("x1", x(lo)).attr("y1", y(lo)).attr("x2", x(hi)).attr("y2", y(hi))
+        .attr("stroke", MUTED).attr("stroke-width", 1.5).attr("stroke-dasharray", "4 4").attr("opacity", 0.7);
+    }
+  }
+
   // points + survol par plus proche voisin (quadtree)
   const g = svg.append("g");
   g.selectAll("circle").data(pts).join("circle")
@@ -327,7 +340,7 @@ export function scatterChart(opts: {
 
   const tree = quadtree<ScatterPoint>().x((p) => x(p.x)).y((p) => y(p.y)).addAll(pts);
   const hi = svg.append("circle").attr("fill", "none").attr("stroke", INK).attr("stroke-width", 2).style("visibility", "hidden");
-  svg.append("rect").attr("x", m.left).attr("y", m.top)
+  const overlay = svg.append("rect").attr("x", m.left).attr("y", m.top)
     .attr("width", W - m.left - m.right).attr("height", H - m.top - m.bottom).attr("fill", "transparent")
     .on("mousemove", (event) => {
       const [mx, my] = pointer(event);
@@ -337,6 +350,13 @@ export function scatterChart(opts: {
       c.showTip(event, p.tip);
     })
     .on("mouseleave", () => { hi.style("visibility", "hidden"); c.hideTip(); });
+  if (opts.onPick) {
+    overlay.style("cursor", "pointer").on("click", (event) => {
+      const [mx, my] = pointer(event);
+      const p = tree.find(mx, my, 40);
+      if (p) opts.onPick!(p);
+    });
+  }
 
   // titres d'axes
   svg.append("text").attr("x", (m.left + W - m.right) / 2).attr("y", H - 4).attr("fill", INK_2)

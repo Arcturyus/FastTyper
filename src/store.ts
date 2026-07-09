@@ -65,6 +65,101 @@ export function wordAvgWpm(s: WordStat): number | null {
   return (s.timedChars / 5) / (s.timeMs / 60000);
 }
 
+/** Un mot avec sa langue d'origine (l'identité de langue est conservée). */
+export type TaggedWord = { lang: LangId; word: string; stat: WordStat };
+
+/**
+ * Charge les stats de mots de plusieurs langues en conservant l'identité de
+ * langue par mot (« police », « important »… existent dans plusieurs langues,
+ * on ne les fusionne donc pas).
+ */
+export function loadWordStatsTagged(langs: LangId[]): TaggedWord[] {
+  const out: TaggedWord[] = [];
+  for (const lang of langs) {
+    const stats = loadWordStats(lang);
+    for (const [word, stat] of Object.entries(stats)) {
+      out.push({ lang, word, stat });
+    }
+  }
+  return out;
+}
+
+/** Fusionne les stats de bigrammes de plusieurs langues (clé = transition). */
+export function loadBigramStatsMerged(langs: LangId[]): Record<string, BigramStat> {
+  const merged: Record<string, BigramStat> = {};
+  for (const lang of langs) {
+    for (const [key, b] of Object.entries(loadBigramStats(lang))) {
+      const cur = merged[key] ?? { count: 0, gapMs: 0, errors: 0 };
+      cur.count += b.count;
+      cur.gapMs += b.gapMs;
+      cur.errors += b.errors;
+      merged[key] = cur;
+    }
+  }
+  return merged;
+}
+
+/** Concatène les journaux bruts de plusieurs langues. */
+export function loadTestLogMulti(langs: LangId[]): TestLog[] {
+  const out: TestLog[] = [];
+  for (const lang of langs) out.push(...loadTestLog(lang));
+  return out;
+}
+
+/**
+ * Vitesse d'un mot ventilée selon l'issue de l'essai : réussi (tapé juste) vs
+ * fauté (tapé en entier mais avec au moins une erreur). Reconstruit depuis le
+ * journal brut, donc rétroactif sur les données existantes.
+ */
+export type OutcomeSpeed = {
+  lang: LangId;
+  word: string;
+  okChars: number;
+  okMs: number;
+  okN: number; // essais réussis chronométrés
+  badChars: number;
+  badMs: number;
+  badN: number; // essais fautés mais complets, chronométrés
+};
+
+const outcomeKey = (lang: LangId, word: string) => `${lang} ${word}`;
+
+/** Agrège, par (langue, mot), la vitesse en réussite vs en échec. */
+export function wordOutcomeSpeeds(logs: TestLog[]): Map<string, OutcomeSpeed> {
+  const map = new Map<string, OutcomeSpeed>();
+  for (const t of logs) {
+    for (const w of t.words) {
+      if (w.timeMs === null || w.timeMs <= 0) continue; // uniquement les mots chronométrés
+      const key = outcomeKey(t.lang, w.text);
+      let o = map.get(key);
+      if (!o) {
+        o = { lang: t.lang, word: w.text, okChars: 0, okMs: 0, okN: 0, badChars: 0, badMs: 0, badN: 0 };
+        map.set(key, o);
+      }
+      if (w.correct) {
+        o.okChars += w.len;
+        o.okMs += w.timeMs;
+        o.okN += 1;
+      } else {
+        o.badChars += w.len;
+        o.badMs += w.timeMs;
+        o.badN += 1;
+      }
+    }
+  }
+  return map;
+}
+
+/** WPM sur les essais réussis, ou null si aucun. */
+export function okWpm(o: OutcomeSpeed): number | null {
+  return o.okN > 0 && o.okMs > 0 ? o.okChars / 5 / (o.okMs / 60000) : null;
+}
+
+/** WPM sur les essais fautés (mais complets), ou null si aucun. */
+export function badWpm(o: OutcomeSpeed): number | null {
+  return o.badN > 0 && o.badMs > 0 ? o.badChars / 5 / (o.badMs / 60000) : null;
+}
+
 /** Part des essais comportant au moins une erreur (0..1) */
 export function wordErrRate(s: WordStat): number {
   return s.attempts > 0 ? s.errorAttempts / s.attempts : 0;
@@ -149,7 +244,7 @@ export function applyResult(
   );
 }
 
-const ALL_LANGS: LangId[] = ["fr", "fr1k", "en", "en1k"];
+export const ALL_LANGS: LangId[] = ["fr", "fr1k", "en", "en1k"];
 
 export function exportData(): string {
   const data: Record<string, unknown> = {

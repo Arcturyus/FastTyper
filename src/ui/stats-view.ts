@@ -1,17 +1,22 @@
 import { loadConfig } from "../config";
 import {
+  ALL_LANGS,
+  badWpm,
   bigramAvgGap,
   exportData,
   importData,
-  loadBigramStats,
+  loadBigramStatsMerged,
   loadHistory,
-  loadTestLog,
-  loadWordStats,
+  loadTestLogMulti,
+  loadWordStatsTagged,
+  okWpm,
   resetData,
   wordAvgWpm,
   wordErrRate,
   wordPosErrorRates,
+  wordOutcomeSpeeds,
 } from "../store";
+import type { OutcomeSpeed, TaggedWord } from "../store";
 import type {
   BigramStat,
   Config,
@@ -32,6 +37,7 @@ import {
   densityHexbin,
   heatmap,
   histogramChart,
+  legend,
   pearson,
   progressionChart,
   ramp,
@@ -39,8 +45,54 @@ import {
   stats as summary,
 } from "./charts";
 
+/** Couleur fixe par langue pour la coloration « par langue ». */
+const LANG_COLOR: Record<LangId, string> = {
+  fr: ACCENT,
+  fr1k: STATUS.warning,
+  en: PACE,
+  en1k: STATUS.good,
+};
+
+/** Ligne d'analyse par mot, agrégée sur une (langue, mot). */
+type WordRow = {
+  lang: LangId;
+  word: string;
+  key: string; // `${lang} ${word}`, identifiant unique
+  stat: WordStat;
+  attempts: number;
+  wpmAll: number | null; // vitesse tous essais chronométrés
+  errRate: number;
+  errors: number;
+  okWpm: number | null; // vitesse en réussite
+  badWpm: number | null; // vitesse en échec (complet mais fauté)
+  okN: number;
+  badN: number;
+};
+
+/** Construit les lignes d'analyse en croisant WordStat et la ventilation d'issue. */
+function buildWordRows(tagged: TaggedWord[], outcome: Map<string, OutcomeSpeed>): WordRow[] {
+  return tagged.map(({ lang, word, stat }) => {
+    const key = `${lang} ${word}`;
+    const o = outcome.get(key);
+    return {
+      lang,
+      word,
+      key,
+      stat,
+      attempts: stat.attempts,
+      wpmAll: wordAvgWpm(stat),
+      errRate: wordErrRate(stat),
+      errors: stat.errors,
+      okWpm: o ? okWpm(o) : null,
+      badWpm: o ? badWpm(o) : null,
+      okN: o ? o.okN : 0,
+      badN: o ? o.badN : 0,
+    };
+  });
+}
+
 type Tab = "progression" | "mots" | "biais" | "bigrammes" | "activite";
-type SortKey = "word" | "attempts" | "wpm" | "errRate" | "errors";
+type SortKey = "word" | "lang" | "attempts" | "wpm" | "okWpm" | "badWpm" | "errRate" | "errors";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "progression", label: "Progression" },
@@ -53,7 +105,7 @@ const TABS: { key: Tab; label: string }[] = [
 export function mountStatsView(root: HTMLElement, signal: AbortSignal): void {
   const cfg = loadConfig();
   // état local (n'altère pas la config globale)
-  let lang: LangId = cfg.lang;
+  const selectedLangs = new Set<LangId>(ALL_LANGS);
   let tab: Tab = "progression";
   let range = 0; // 0 = tout, sinon N derniers tests
 
@@ -62,22 +114,33 @@ export function mountStatsView(root: HTMLElement, signal: AbortSignal): void {
   // --- en-tête ---
   const header = el("div", "stats-header");
   header.append(el("h2", "page-title", "Statistiques"));
-  const langSel = el("select");
-  for (const id of Object.keys(LANGS) as LangId[]) {
-    const opt = el("option", undefined, LANGS[id].label);
-    opt.value = id;
-    if (id === lang) opt.selected = true;
-    langSel.append(opt);
+
+  // barre de langues (multi-sélection, au moins une active)
+  const langBar = el("div", "lang-filter");
+  langBar.append(el("span", "lang-filter-label", "Langues"));
+  const langPills = new Map<LangId, HTMLElement>();
+  for (const id of ALL_LANGS) {
+    const pill = el("button", "pill on", LANGS[id].label);
+    pill.style.setProperty("--lang-dot", LANG_COLOR[id]);
+    pill.classList.add("lang-pill");
+    pill.addEventListener(
+      "click",
+      () => {
+        if (selectedLangs.has(id)) {
+          if (selectedLangs.size === 1) return; // garde-fou : au moins une langue
+          selectedLangs.delete(id);
+        } else {
+          selectedLangs.add(id);
+        }
+        pill.classList.toggle("on", selectedLangs.has(id));
+        renderTab();
+      },
+      { signal }
+    );
+    langPills.set(id, pill);
+    langBar.append(pill);
   }
-  langSel.addEventListener(
-    "change",
-    () => {
-      lang = langSel.value as LangId;
-      renderTab();
-    },
-    { signal }
-  );
-  header.append(langSel);
+  header.append(langBar);
   root.append(header);
 
   // --- barre d'onglets ---
@@ -104,22 +167,22 @@ export function mountStatsView(root: HTMLElement, signal: AbortSignal): void {
   function renderTab(): void {
     for (const [key, btn] of tabBtns) btn.classList.toggle("active", key === tab);
     content.innerHTML = "";
-    const words = loadWordStats(lang);
-    const bigrams = loadBigramStats(lang);
-    const history = loadHistory().filter((h) => h.lang === lang);
+    const langs = ALL_LANGS.filter((l) => selectedLangs.has(l));
+    const tagged = loadWordStatsTagged(langs);
+    const history = loadHistory().filter((h) => selectedLangs.has(h.lang));
 
     switch (tab) {
       case "progression":
-        renderProgression(content, cfg, history, words, () => range, (r) => (range = r), renderTab, signal);
+        renderProgression(content, cfg, history, tagged, () => range, (r) => (range = r), renderTab, signal);
         break;
       case "mots":
-        renderWords(content, cfg, lang, words, signal);
+        renderWords(content, cfg, langs, tagged, loadTestLogMulti(langs), signal);
         break;
       case "biais":
-        renderBias(content, loadTestLog(lang), signal);
+        renderBias(content, loadTestLogMulti(langs), langs.length > 1, signal);
         break;
       case "bigrammes":
-        renderBigrams(content, bigrams);
+        renderBigrams(content, loadBigramStatsMerged(langs));
         break;
       case "activite":
         renderActivity(content, history, root, signal);
@@ -136,14 +199,14 @@ function renderProgression(
   root: HTMLElement,
   cfg: Config,
   fullHistory: HistoryEntry[],
-  words: Record<string, WordStat>,
+  tagged: TaggedWord[],
   getRange: () => number,
   setRange: (r: number) => void,
   rerender: () => void,
   signal: AbortSignal
 ): void {
   if (fullHistory.length === 0) {
-    root.append(el("div", "empty-note", "Aucun test enregistré dans cette langue — lance-toi !"));
+    root.append(el("div", "empty-note", "Aucun test enregistré pour les langues sélectionnées — lance-toi !"));
     return;
   }
   const range = getRange();
@@ -157,7 +220,7 @@ function renderProgression(
   const avgRecent = recent.reduce((s, h) => s + h.wpm, 0) / recent.length;
   const avgAcc = history.reduce((s, h) => s + h.accuracy, 0) / history.length;
   const totalMs = fullHistory.reduce((s, h) => s + h.durationMs, 0);
-  const trackedWords = Object.keys(words).length;
+  const trackedWords = new Set(tagged.map((t) => t.word)).size;
 
   const cards = el("div", "cards-row");
   const mk = (label: string, value: string, hint?: string) => {
@@ -266,55 +329,37 @@ function renderProgression(
 function renderWords(
   root: HTMLElement,
   cfg: Config,
-  lang: LangId,
-  words: Record<string, WordStat>,
+  langs: LangId[],
+  tagged: TaggedWord[],
+  logs: TestLog[],
   signal: AbortSignal
 ): void {
-  const entries = Object.entries(words);
-  if (entries.length === 0) {
+  if (tagged.length === 0) {
     root.append(el("div", "empty-note", "Aucune donnée de mot — fais quelques tests !"));
     return;
   }
+  const outcome = wordOutcomeSpeeds(logs);
+  const rows = buildWordRows(tagged, outcome);
+  const multiLang = langs.length > 1;
 
-  // --- nuage quadrant vitesse × fautes ---
-  const scatterPts = entries
-    .map(([word, s]) => ({ word, s, wpm: wordAvgWpm(s), err: wordErrRate(s) }))
-    .filter((d) => d.wpm !== null && d.s.attempts >= cfg.minAttempts)
-    .map((d) => {
-      const slow = d.wpm! <= cfg.slowWpm;
-      const faulty = d.err >= cfg.errWarnRate;
-      const tint = slow && faulty ? STATUS.critical : faulty ? STATUS.serious : slow ? STATUS.warning : STATUS.good;
-      return {
-        x: d.wpm!,
-        y: d.err * 100,
-        r: Math.min(3, Math.log2(d.s.attempts + 1) / 2),
-        tint,
-        tip: `<b class="mono">${d.word}</b><br><span class="t-dim">${fmt(d.wpm!)} wpm · ${fmtPct(d.err)} fautés · ${d.s.attempts} essais</span>`,
-      };
-    });
+  // le tableau expose une fonction de surbrillance, câblée au clic sur la carto
+  const table = buildWordTable(cfg, rows, multiLang, signal);
 
-  root.append(
-    scatterChart({
-      title: "Cartographie des mots",
-      subtitle: "taille = nombre d'essais · couleur = quadrant",
-      points: scatterPts,
-      xLabel: "WPM moyen",
-      yLabel: "% essais fautés",
-      yFormat: (v) => fmt(v) + " %",
-      vLines: [{ x: cfg.slowWpm, color: STATUS.warning }],
-      hLines: [{ y: cfg.errWarnRate * 100, color: STATUS.critical }],
-      quadrants: [
-        { xAt: "min", yAt: "max", label: "à retravailler", tint: STATUS.critical },
-        { xAt: "max", yAt: "max", label: "fautifs", tint: STATUS.serious },
-        { xAt: "min", yAt: "min", label: "lents", tint: STATUS.warning },
-        { xAt: "max", yAt: "min", label: "maîtrisés", tint: STATUS.good },
-      ],
-      height: 340,
+  // --- cartographie interactive ---
+  root.append(buildCartography(cfg, rows, multiLang, langs, (key) => table.focus(key), signal));
+
+  // --- vitesse réussite vs échec ---
+  renderOutcomeSpeed(root, rows, multiLang);
+
+  // --- top mots à travailler (agrégé sur les langues sélectionnées) ---
+  const pool = langs
+    .flatMap((l) => {
+      const rec: Record<string, WordStat> = {};
+      for (const r of rows) if (r.lang === l) rec[r.word] = r.stat;
+      return practicePool(l, cfg, rec).map((p) => ({ ...p, lang: l }));
     })
-  );
-
-  // --- top mots à travailler ---
-  const pool = practicePool(lang, cfg, words).slice(0, 12);
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 12);
   if (pool.length > 0) {
     root.append(
       barChart({
@@ -325,7 +370,7 @@ function renderWords(
           value: p.score,
           mono: true,
           tint: ramp(0.4 + 0.6 * Math.min(1, p.score / 2), STATUS.critical),
-          sub: `${p.avgWpm === null ? "—" : fmt(p.avgWpm)} wpm · ${fmtPct(p.errRate)}`,
+          sub: `${multiLang ? LANGS[p.lang].label.split(" ")[0] + " · " : ""}${p.avgWpm === null ? "—" : fmt(p.avgWpm)} wpm · ${fmtPct(p.errRate)}`,
         })),
         format: (v) => fmt(v, 2),
       })
@@ -333,7 +378,7 @@ function renderWords(
   }
 
   // --- où l'on faute dans le mot (par position) ---
-  const posAgg = aggregatePositions(words);
+  const posAgg = aggregatePositions(rows.map((r) => r.stat));
   if (posAgg.length > 0) {
     root.append(
       barChart({
@@ -350,13 +395,181 @@ function renderWords(
   }
 
   // --- tableau détaillé ---
-  root.append(buildWordTable(cfg, words, signal));
+  root.append(table.box);
 }
 
-function aggregatePositions(words: Record<string, WordStat>): number[] {
+/**
+ * Cartographie interactive des mots. Contrôles : axe vitesse (tous / réussis),
+ * couleur (quadrant / langue), seuils réglables en direct. Le clic sur un point
+ * remonte sa clé pour surligner la ligne du tableau détaillé.
+ */
+function buildCartography(
+  cfg: Config,
+  rows: WordRow[],
+  multiLang: boolean,
+  langs: LangId[],
+  onPick: (key: string) => void,
+  signal: AbortSignal
+): HTMLElement {
+  const box = el("div", "carto-block");
+
+  // état local des contrôles (n'écrit jamais la config globale)
+  let axis: "all" | "ok" = "all";
+  let color: "quadrant" | "lang" = "quadrant";
+  let slow = cfg.slowWpm;
+  let fast = cfg.fastWpm;
+  let err = cfg.errWarnRate;
+
+  const controls = el("div", "carto-controls");
+
+  // bascule axe vitesse
+  const axisSeg = segToggle(
+    [{ key: "all", label: "tous essais" }, { key: "ok", label: "réussis seulement" }],
+    axis,
+    (k) => { axis = k as typeof axis; draw(); },
+    signal
+  );
+  // bascule couleur
+  const colorSeg = segToggle(
+    [{ key: "quadrant", label: "quadrant" }, { key: "lang", label: "langue" }],
+    color,
+    (k) => { color = k as typeof color; draw(); },
+    signal
+  );
+  controls.append(
+    labeled("Vitesse", axisSeg),
+    labeled("Couleur", colorSeg),
+    slider("lent ≤", slow, 10, 120, 1, (v) => { slow = v; draw(); }, (v) => fmt(v), signal),
+    slider("rapide ≥", fast, 10, 160, 1, (v) => { fast = v; draw(); }, (v) => fmt(v), signal),
+    slider("fautés ≥", Math.round(err * 100), 0, 100, 1, (v) => { err = v / 100; draw(); }, (v) => fmt(v) + " %", signal)
+  );
+  box.append(controls);
+
+  const host = el("div", "carto-host");
+  box.append(host);
+
+  function draw(): void {
+    host.innerHTML = "";
+    const pts = rows
+      .map((r) => ({ r, x: axis === "ok" ? r.okWpm : r.wpmAll }))
+      .filter((d) => d.x !== null && d.r.attempts >= cfg.minAttempts)
+      .map((d) => {
+        const isSlow = d.x! <= slow;
+        const faulty = d.r.errRate >= err;
+        const quad = isSlow && faulty ? STATUS.critical : faulty ? STATUS.serious : isSlow ? STATUS.warning : STATUS.good;
+        const langLabel = multiLang ? `<br><span class="t-dim">${LANGS[d.r.lang].label}</span>` : "";
+        const okTip = d.r.okWpm !== null ? ` · ✓ ${fmt(d.r.okWpm)}` : "";
+        const badTip = d.r.badWpm !== null ? ` · ✗ ${fmt(d.r.badWpm)}` : "";
+        return {
+          x: d.x!,
+          y: d.r.errRate * 100,
+          r: Math.min(3, Math.log2(d.r.attempts + 1) / 2),
+          tint: color === "lang" ? LANG_COLOR[d.r.lang] : quad,
+          key: d.r.key,
+          tip: `<b class="mono">${d.r.word}</b>${langLabel}<br><span class="t-dim">${fmt(d.x!)} wpm${okTip}${badTip} · ${fmtPct(d.r.errRate)} fautés · ${d.r.attempts} essais</span>`,
+        };
+      });
+
+    host.append(
+      scatterChart({
+        title: "Cartographie des mots",
+        subtitle: `${axis === "ok" ? "vitesse en réussite" : "vitesse tous essais"} · taille = essais · ${color === "lang" ? "couleur = langue" : "couleur = quadrant"}`,
+        points: pts,
+        xLabel: axis === "ok" ? "WPM en réussite" : "WPM moyen",
+        yLabel: "% essais fautés",
+        yFormat: (v) => fmt(v) + " %",
+        vLines: [{ x: slow, color: STATUS.warning }, { x: fast, color: STATUS.good }],
+        hLines: [{ y: err * 100, color: STATUS.critical }],
+        quadrants: color === "quadrant" ? [
+          { xAt: "min", yAt: "max", label: "à retravailler", tint: STATUS.critical },
+          { xAt: "max", yAt: "max", label: "fautifs", tint: STATUS.serious },
+          { xAt: "min", yAt: "min", label: "lents", tint: STATUS.warning },
+          { xAt: "max", yAt: "min", label: "maîtrisés", tint: STATUS.good },
+        ] : undefined,
+        onPick: (p) => { if (p.key) onPick(p.key); },
+        height: 340,
+      })
+    );
+
+    if (color === "lang" && multiLang) {
+      host.append(legend(langs.map((l) => ({ label: LANGS[l].label, color: LANG_COLOR[l] }))));
+    }
+  }
+  draw();
+  return box;
+}
+
+/**
+ * Section « vitesse : réussite vs échec ». Croise, par mot, la vitesse quand on
+ * le tape juste et la vitesse quand on le tape en entier mais fauté.
+ */
+function renderOutcomeSpeed(root: HTMLElement, rows: WordRow[], multiLang: boolean): void {
+  const data = rows
+    .filter((r) => r.okWpm !== null && r.badWpm !== null && r.okN >= 2 && r.badN >= 1)
+    .map((r) => ({ ...r, gap: r.okWpm! - r.badWpm! }));
+  if (data.length === 0) {
+    root.append(el("div", "empty-note", "Vitesse réussite vs échec : il faut quelques mots réussis ET ratés (tapés en entier) pour comparer."));
+    return;
+  }
+
+  // --- tuiles de synthèse ---
+  const avgGap = data.reduce((s, d) => s + d.gap, 0) / data.length;
+  const slowerWhenBad = data.filter((d) => d.gap > 0).length;
+  const cards = el("div", "cards-row");
+  const mk = (label: string, value: string, hint?: string) => {
+    const tile = el("div", "tile");
+    tile.append(el("div", "label", label), el("div", "value", value));
+    if (hint) tile.append(el("div", "tile-hint", hint));
+    return tile;
+  };
+  cards.append(
+    mk("mots comparés", fmt(data.length)),
+    mk("écart moyen", (avgGap >= 0 ? "−" : "+") + fmt(Math.abs(avgGap)) + " wpm", "réussi vs fauté"),
+    mk("plus lent si fauté", fmtPct(slowerWhenBad / data.length), `${slowerWhenBad}/${data.length} mots`)
+  );
+  root.append(cards);
+
+  // --- nuage okWpm vs badWpm avec diagonale d'égalité ---
+  root.append(
+    scatterChart({
+      title: "Vitesse : réussite vs échec",
+      subtitle: "sous la diagonale = plus lent quand le mot est fauté",
+      points: data.map((d) => ({
+        x: d.okWpm!,
+        y: d.badWpm!,
+        r: Math.min(3, Math.log2(d.okN + d.badN + 1) / 2),
+        tint: d.gap > 0 ? STATUS.warning : STATUS.good,
+        tip: `<b class="mono">${d.word}</b>${multiLang ? `<br><span class="t-dim">${LANGS[d.lang].label}</span>` : ""}<br><span class="t-dim">✓ ${fmt(d.okWpm!)} · ✗ ${fmt(d.badWpm!)} wpm · écart ${fmt(d.gap)}</span>`,
+      })),
+      xLabel: "WPM en réussite",
+      yLabel: "WPM en échec",
+      diagonal: true,
+      height: 320,
+    })
+  );
+
+  // --- top mots au plus gros écart ---
+  const top = [...data].sort((a, b) => b.gap - a.gap).slice(0, 12);
+  root.append(
+    barChart({
+      title: "Mots les plus pénalisés par l'erreur",
+      subtitle: "écart de vitesse réussite − échec",
+      items: top.map((d) => ({
+        label: d.word,
+        value: d.gap,
+        mono: true,
+        tint: ramp(0.3 + 0.7 * Math.min(1, d.gap / 40), STATUS.serious),
+        sub: `${fmt(d.badWpm!)} → ${fmt(d.okWpm!)} wpm`,
+      })),
+      format: (v) => fmt(v) + " wpm",
+    })
+  );
+}
+
+function aggregatePositions(stats: WordStat[]): number[] {
   const sumRate: number[] = [];
   const sumWeight: number[] = [];
-  for (const s of Object.values(words)) {
+  for (const s of stats) {
     if (s.attempts < 1) continue;
     // longueur estimée = longueur du tableau de positions
     const len = s.posErrors?.length ?? 0;
@@ -374,13 +587,20 @@ function aggregatePositions(words: Record<string, WordStat>): number[] {
   return out;
 }
 
-function buildWordTable(cfg: Config, stats: Record<string, WordStat>, signal: AbortSignal): HTMLElement {
+/** Tableau détaillé, avec surbrillance pilotable depuis la cartographie. */
+function buildWordTable(
+  cfg: Config,
+  allRows: WordRow[],
+  multiLang: boolean,
+  signal: AbortSignal
+): { box: HTMLElement; focus: (key: string) => void } {
   const box = el("div", "chart-card");
   box.append(cardHead("Détail par mot"));
   let search = "";
   let minAttempts = 1;
   let sortKey: SortKey = "errRate";
   let sortDesc = true;
+  let focusKey: string | null = null;
 
   const filters = el("div", "filters-row");
   const searchInput = el("input");
@@ -403,9 +623,8 @@ function buildWordTable(cfg: Config, stats: Record<string, WordStat>, signal: Ab
 
   function render(): void {
     tableWrap.innerHTML = "";
-    const rows = Object.entries(stats)
-      .filter(([w, s]) => s.attempts >= minAttempts && (search === "" || w.toLowerCase().includes(search)))
-      .map(([word, s]) => ({ word, stat: s, attempts: s.attempts, wpm: wordAvgWpm(s), errRate: wordErrRate(s), errors: s.errors }));
+    const rows = allRows
+      .filter((r) => r.attempts >= minAttempts && (search === "" || r.word.toLowerCase().includes(search)));
     if (rows.length === 0) {
       tableWrap.append(el("div", "empty-note", "Aucun mot ne correspond."));
       return;
@@ -414,8 +633,11 @@ function buildWordTable(cfg: Config, stats: Record<string, WordStat>, signal: Ab
       let diff: number;
       switch (sortKey) {
         case "word": diff = a.word.localeCompare(b.word, "fr"); break;
+        case "lang": diff = a.lang.localeCompare(b.lang); break;
         case "attempts": diff = a.attempts - b.attempts; break;
-        case "wpm": diff = (a.wpm ?? Infinity) - (b.wpm ?? Infinity); break;
+        case "wpm": diff = (a.wpmAll ?? Infinity) - (b.wpmAll ?? Infinity); break;
+        case "okWpm": diff = (a.okWpm ?? Infinity) - (b.okWpm ?? Infinity); break;
+        case "badWpm": diff = (a.badWpm ?? Infinity) - (b.badWpm ?? Infinity); break;
         case "errors": diff = a.errors - b.errors; break;
         default: diff = a.errRate - b.errRate;
       }
@@ -425,19 +647,23 @@ function buildWordTable(cfg: Config, stats: Record<string, WordStat>, signal: Ab
     const table = el("table", "data");
     const thead = el("thead");
     const headRow = el("tr");
-    const cols: { key: SortKey; label: string; num: boolean }[] = [
+    const allCols: { key: SortKey; label: string; num: boolean; only?: boolean }[] = [
       { key: "word", label: "mot", num: false },
+      { key: "lang", label: "langue", num: false, only: multiLang },
       { key: "attempts", label: "essais", num: true },
       { key: "wpm", label: "wpm moyen", num: true },
+      { key: "okWpm", label: "wpm ✓", num: true },
+      { key: "badWpm", label: "wpm ✗", num: true },
       { key: "errRate", label: "% fautés", num: true },
       { key: "errors", label: "erreurs", num: true },
     ];
+    const cols = allCols.filter((c) => c.only !== false);
     for (const col of cols) {
       const th = el("th", col.num ? "num" : undefined, col.label);
       if (sortKey === col.key) { th.classList.add("sorted"); th.textContent += sortDesc ? " ↓" : " ↑"; }
       th.addEventListener("click", () => {
         if (sortKey === col.key) sortDesc = !sortDesc;
-        else { sortKey = col.key; sortDesc = col.key !== "word"; }
+        else { sortKey = col.key; sortDesc = col.key !== "word" && col.key !== "lang"; }
         render();
       });
       headRow.append(th);
@@ -446,18 +672,29 @@ function buildWordTable(cfg: Config, stats: Record<string, WordStat>, signal: Ab
     table.append(thead);
 
     const tbody = el("tbody");
+    let focusTr: HTMLElement | null = null;
     for (const rrow of rows.slice(0, 200)) {
       const tr = el("tr");
+      if (rrow.key === focusKey) { tr.classList.add("row-focus"); focusTr = tr; }
       const tdWord = el("td");
       const chip = el("span", "word-chip", rrow.word);
       for (const cclass of wordClasses(rrow.stat, { ...cfg, colorBy: "both" })) chip.classList.add(cclass);
       tdWord.append(chip);
       const spark = posSparkline(rrow.word, rrow.stat);
       if (spark) tdWord.append(spark);
+      tr.append(tdWord);
+      if (multiLang) {
+        const tdLang = el("td");
+        const badge = el("span", "lang-badge", LANGS[rrow.lang].label);
+        badge.style.setProperty("--lang-dot", LANG_COLOR[rrow.lang]);
+        tdLang.append(badge);
+        tr.append(tdLang);
+      }
       tr.append(
-        tdWord,
         el("td", "num", fmt(rrow.attempts)),
-        el("td", "num", rrow.wpm === null ? "—" : fmt(rrow.wpm)),
+        el("td", "num", rrow.wpmAll === null ? "—" : fmt(rrow.wpmAll)),
+        el("td", "num", rrow.okWpm === null ? "—" : fmt(rrow.okWpm)),
+        el("td", "num", rrow.badWpm === null ? "—" : fmt(rrow.badWpm)),
         el("td", "num", fmtPct(rrow.errRate)),
         el("td", "num", fmt(rrow.errors))
       );
@@ -466,9 +703,76 @@ function buildWordTable(cfg: Config, stats: Record<string, WordStat>, signal: Ab
     table.append(tbody);
     tableWrap.append(table);
     if (rows.length > 200) tableWrap.append(el("div", "empty-note", `${rows.length - 200} mots masqués — affine la recherche.`));
+    if (focusTr) focusTr.scrollIntoView({ block: "nearest" });
   }
   render();
-  return box;
+
+  const focus = (key: string): void => {
+    focusKey = key;
+    // vide la recherche pour garantir la présence de la ligne ciblée
+    const row = allRows.find((r) => r.key === key);
+    if (row && !row.word.toLowerCase().includes(search)) { search = ""; searchInput.value = ""; }
+    if (row && row.attempts < minAttempts) { minAttempts = 1; minInput.value = "1"; }
+    render();
+    box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  };
+  return { box, focus };
+}
+
+/** Segment de bascule réutilisable (petit groupe de boutons mutuellement exclusifs). */
+function segToggle(
+  options: { key: string; label: string }[],
+  active: string,
+  onChange: (key: string) => void,
+  signal: AbortSignal
+): HTMLElement {
+  const seg = el("div", "seg-toggle");
+  for (const o of options) {
+    const btn = el("button", "seg-btn" + (o.key === active ? " on" : ""), o.label);
+    btn.addEventListener("click", () => {
+      for (const b of seg.querySelectorAll("button")) b.classList.remove("on");
+      btn.classList.add("on");
+      onChange(o.key);
+    }, { signal });
+    seg.append(btn);
+  }
+  return seg;
+}
+
+/** Enveloppe un contrôle d'un petit intitulé. */
+function labeled(label: string, control: HTMLElement): HTMLElement {
+  const wrap = el("div", "ctrl");
+  wrap.append(el("span", "ctrl-label", label), control);
+  return wrap;
+}
+
+/** Curseur avec valeur affichée en direct. */
+function slider(
+  label: string,
+  value: number,
+  min: number,
+  max: number,
+  step: number,
+  onInput: (v: number) => void,
+  fmtVal: (v: number) => string,
+  signal: AbortSignal
+): HTMLElement {
+  const wrap = el("div", "ctrl ctrl-slider");
+  wrap.append(el("span", "ctrl-label", label));
+  const input = el("input");
+  input.type = "range";
+  input.min = String(min);
+  input.max = String(max);
+  input.step = String(step);
+  input.value = String(value);
+  const out = el("span", "ctrl-value", fmtVal(value));
+  input.addEventListener("input", () => {
+    const v = Number(input.value);
+    out.textContent = fmtVal(v);
+    onInput(v);
+  }, { signal });
+  wrap.append(input, out);
+  return wrap;
 }
 
 /** Mini barres de taux de faute par position, superposées au mot. */
@@ -512,6 +816,7 @@ type BiasWord = {
   wordCount: number;
   pace: boolean;
   mode: TestLog["mode"];
+  lang: LangId;
   timeMs: number | null;
   errors: number;
 };
@@ -560,6 +865,15 @@ const BIAS_DIMS: Dimension[] = [
   },
 ];
 
+/** Dimension « Langue » : n'a de sens qu'avec plusieurs langues sélectionnées. */
+const LANG_DIM: Dimension = {
+  key: "lang",
+  label: "Langue",
+  hint: "quelle langue est la plus rapide / la plus fautée ?",
+  buckets: ALL_LANGS.map((l) => LANGS[l].label),
+  of: (w) => LANGS[w.lang].label,
+};
+
 type Bucket = {
   label: string;
   words: number; // mots atteints
@@ -595,7 +909,7 @@ function computeBuckets(words: BiasWord[], dim: Dimension): Bucket[] {
   return dim.buckets.map((l) => map.get(l)!).filter((b) => b.words > 0);
 }
 
-function renderBias(root: HTMLElement, logs: TestLog[], signal: AbortSignal): void {
+function renderBias(root: HTMLElement, logs: TestLog[], showLang: boolean, signal: AbortSignal): void {
   const words: BiasWord[] = [];
   for (const t of logs) {
     for (const w of t.words) {
@@ -605,11 +919,13 @@ function renderBias(root: HTMLElement, logs: TestLog[], signal: AbortSignal): vo
         wordCount: t.wordCount,
         pace: t.pace,
         mode: t.mode,
+        lang: t.lang,
         timeMs: w.timeMs,
         errors: w.errors,
       });
     }
   }
+  const dims = showLang ? [LANG_DIM, ...BIAS_DIMS] : BIAS_DIMS;
 
   if (words.length === 0) {
     root.append(
@@ -631,9 +947,9 @@ function renderBias(root: HTMLElement, logs: TestLog[], signal: AbortSignal): vo
   root.append(intro);
 
   // --- sélecteur de dimension ---
-  let dim = BIAS_DIMS[0] as Dimension;
+  let dim = dims[0] as Dimension;
   const toggle = el("div", "seg-toggle");
-  for (const d of BIAS_DIMS) {
+  for (const d of dims) {
     const btn = el("button", "seg-btn" + (d.key === dim.key ? " on" : ""), d.label);
     btn.dataset["dim"] = d.key;
     btn.addEventListener("click", () => { dim = d; renderDim(); }, { signal });
