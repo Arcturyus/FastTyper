@@ -1,6 +1,19 @@
 import { DEFAULT_CONFIG, loadConfig, saveConfig } from "../config";
+import { exportData, importData } from "../store";
 import type { Config } from "../types";
 import { el, toast } from "./common";
+
+/** Déclenche le téléchargement d'un fichier texte côté navigateur. */
+function downloadText(filename: string, text: string): void {
+  const blob = new Blob([text], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = el("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  // Libère l'URL après un court délai (le clic est synchrone mais la lecture peut suivre).
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 type NumField = {
   key: keyof Config;
@@ -11,6 +24,41 @@ type NumField = {
   asPercent?: boolean;
 };
 
+/** Déclenche `action` au clic, puis en rafale accélérée tant que le bouton reste enfoncé. */
+function bindRepeat(btn: HTMLButtonElement, action: () => void, signal: AbortSignal): void {
+  let timer: number | undefined;
+  let delay = 400;
+
+  const stop = () => {
+    window.clearTimeout(timer);
+    timer = undefined;
+    delay = 400;
+  };
+  const tick = () => {
+    if (btn.disabled) {
+      stop();
+      return;
+    }
+    action();
+    delay = Math.max(40, delay * 0.75);
+    timer = window.setTimeout(tick, delay);
+  };
+
+  btn.addEventListener(
+    "pointerdown",
+    (e) => {
+      if (btn.disabled) return;
+      e.preventDefault();
+      action();
+      timer = window.setTimeout(tick, delay);
+    },
+    { signal }
+  );
+  for (const evt of ["pointerup", "pointerleave", "pointercancel"]) {
+    btn.addEventListener(evt, stop, { signal });
+  }
+}
+
 export function mountSettingsView(root: HTMLElement, signal: AbortSignal): void {
   let cfg = loadConfig();
   root.innerHTML = "";
@@ -19,26 +67,56 @@ export function mountSettingsView(root: HTMLElement, signal: AbortSignal): void 
   function numRow(field: NumField): HTMLElement {
     const row = el("div", "field-row");
     row.append(el("label", undefined, field.label));
-    const input = el("input");
+
+    // Tout se passe dans l'espace « affiché » (pourcentage entier si asPercent,
+    // sinon la valeur brute) — la conversion vers cfg n'a lieu qu'à l'écriture.
+    const step = field.step ?? 1;
+    const raw = cfg[field.key] as number;
+    const toDisplay = (v: number) => (field.asPercent ? Math.round(v * 100) : v);
+    const toStored = (v: number) => (field.asPercent ? v / 100 : v);
+
+    const stepper = el("div", "num-stepper");
+    const minusBtn = el("button", "num-stepper-btn", "−");
+    minusBtn.type = "button";
+    const input = el("input", "num-stepper-input");
     input.type = "number";
     input.min = String(field.min);
     input.max = String(field.max);
-    input.step = String(field.step ?? 1);
-    const raw = cfg[field.key] as number;
-    input.value = String(field.asPercent ? Math.round(raw * 100) : raw);
+    input.step = String(step);
+    input.inputMode = "numeric";
+    input.value = String(toDisplay(raw));
+    const plusBtn = el("button", "num-stepper-btn", "+");
+    plusBtn.type = "button";
+
+    function updateDisabled(): void {
+      const v = Number(input.value);
+      minusBtn.disabled = v <= field.min;
+      plusBtn.disabled = v >= field.max;
+    }
+
+    const commit = (displayValue: number) => {
+      const clamped = Math.min(field.max, Math.max(field.min, displayValue));
+      input.value = String(clamped);
+      (cfg[field.key] as number) = toStored(clamped);
+      saveConfig(cfg);
+      updateDisabled();
+    };
+
+    bindRepeat(minusBtn, () => commit(Number(input.value) - step), signal);
+    bindRepeat(plusBtn, () => commit(Number(input.value) + step), signal);
     input.addEventListener(
       "change",
       () => {
-        let value = Number(input.value);
+        const value = Number(input.value);
         if (Number.isNaN(value)) return;
-        value = Math.min(field.max, Math.max(field.min, value));
-        input.value = String(value);
-        (cfg[field.key] as number) = field.asPercent ? value / 100 : value;
-        saveConfig(cfg);
+        commit(value);
       },
       { signal }
     );
-    row.append(input);
+
+    updateDisabled();
+    stepper.append(minusBtn, input, plusBtn);
+    row.append(stepper);
     return row;
   }
 
@@ -48,6 +126,7 @@ export function mountSettingsView(root: HTMLElement, signal: AbortSignal): void 
   ): HTMLElement {
     const row = el("div", "field-row");
     row.append(el("label", undefined, label));
+    const toggle = el("label", "toggle");
     const input = el("input");
     input.type = "checkbox";
     input.checked = cfg[key] as boolean;
@@ -59,7 +138,9 @@ export function mountSettingsView(root: HTMLElement, signal: AbortSignal): void 
       },
       { signal }
     );
-    row.append(input);
+    const track = el("span", "toggle-track");
+    toggle.append(input, track);
+    row.append(toggle);
     return row;
   }
 
@@ -153,6 +234,65 @@ export function mountSettingsView(root: HTMLElement, signal: AbortSignal): void 
     numRow({ key: "practicePoolSize", label: "Taille max du pool de mots", min: 5, max: 200 })
   );
   root.append(practiceGroup);
+
+  // --- sauvegarde ---
+  const backupGroup = el("div", "settings-group");
+  backupGroup.append(el("h3", undefined, "Sauvegarde"));
+  backupGroup.append(
+    el(
+      "p",
+      "hint",
+      "Exporte toutes tes données (réglages, historique, stats par mot, journaux) dans un fichier. Transfère-le sur un autre appareil puis importe-le pour retrouver ta progression. Sans compte ni serveur."
+    )
+  );
+
+  const backupRow = el("div", "field-row");
+  backupRow.append(el("label", undefined, "Fichier de sauvegarde"));
+  const backupBtns = el("div", "num-stepper");
+
+  const exportBtn = el("button", "btn", "⬇ Télécharger");
+  exportBtn.type = "button";
+  exportBtn.addEventListener(
+    "click",
+    () => {
+      const stamp = new Date().toISOString().slice(0, 10); // AAAA-MM-JJ
+      downloadText(`fasttyper-sauvegarde-${stamp}.json`, exportData());
+      toast("Sauvegarde téléchargée.");
+    },
+    { signal }
+  );
+
+  const importBtn = el("button", "btn", "⬆ Importer");
+  importBtn.type = "button";
+  const fileInput = el("input");
+  fileInput.type = "file";
+  fileInput.accept = "application/json,.json";
+  fileInput.hidden = true;
+  importBtn.addEventListener("click", () => fileInput.click(), { signal });
+  fileInput.addEventListener(
+    "change",
+    async () => {
+      const file = fileInput.files?.[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        importData(text);
+        toast("Sauvegarde importée.");
+        // Recharge pour que toutes les vues reflètent les données importées.
+        setTimeout(() => location.reload(), 600);
+      } catch {
+        toast("Import impossible : fichier invalide.");
+      } finally {
+        fileInput.value = ""; // permet de réimporter le même fichier
+      }
+    },
+    { signal }
+  );
+
+  backupBtns.append(exportBtn, importBtn, fileInput);
+  backupRow.append(backupBtns);
+  backupGroup.append(backupRow);
+  root.append(backupGroup);
 
   // --- remise à zéro ---
   const resetGroup = el("div", "settings-group");

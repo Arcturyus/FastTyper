@@ -49,6 +49,25 @@ export function ramp(t: number, hue: string): string {
   return interpolateRgb("#171206", hue)(0.1 + 0.9 * c);
 }
 
+/**
+ * Échelle divergente « vitesse » calquée sur la coloration des mots pendant le
+ * test, mais poussée à l'extrême : t = 0 (le plus rapide) vire à l'or lumineux,
+ * t = 1 (le plus lent) au rouge sanguin, et tout le milieu reste brun sombre et
+ * peu visible. La puissance concentre l'éclat sur les deux bords.
+ */
+const SPD_MID = "#241a08"; // brun sombre du milieu (peu visible)
+const SPD_GOLD = "#ffe6a0"; // rapide
+const SPD_RED = "#ff5a3a"; // lent
+export function speedRamp(t: number): string {
+  const x = Math.max(0, Math.min(1, t));
+  if (x <= 0.5) {
+    const w = Math.pow((0.5 - x) / 0.5, 2.4); // 1 au plus rapide → 0 au milieu
+    return interpolateRgb(SPD_MID, SPD_GOLD)(w);
+  }
+  const w = Math.pow((x - 0.5) / 0.5, 2.4); // 0 au milieu → 1 au plus lent
+  return interpolateRgb(SPD_MID, SPD_RED)(w);
+}
+
 // ---- carte + tooltip partagés ---------------------------------------------
 type SvgSel = Selection<SVGSVGElement, unknown, null, undefined>;
 
@@ -425,7 +444,7 @@ export function densityHexbin(opts: {
     .attr("transform", `rotate(-90 12 ${(m.top + H - m.bottom) / 2})`).text(opts.yLabel);
 
   c.card.append(svg.node()!);
-  c.card.append(rampLegend(1, maxCount, hue, (v) => numFmt(v) + " test(s)"));
+  c.card.append(rampLegend(1, maxCount, (t) => ramp(t, hue), (v) => numFmt(v) + " test(s)"));
   return c.card;
 }
 
@@ -441,10 +460,21 @@ export function heatmap(opts: {
   tip: (row: string, col: string, v: number) => string;
   hue: string;
   legendFormat?: (v: number) => string;
+  /** Coloration personnalisée t (0..1) → couleur ; remplace la rampe `hue`. */
+  color?: (t: number) => string;
+  /** Transforme un caractère de ligne/colonne en libellé affiché (ex. " " → "␣"). */
+  label?: (ch: string) => string;
+  /** Marges : valeur agrégée par ligne / colonne, affichée dans une bande « Σ ». */
+  rowMargin?: (row: string) => { v: number | null; tip: string };
+  colMargin?: (col: string) => { v: number | null; tip: string };
+  marginHeader?: string;
+  cornerTip?: string;
 }): HTMLElement {
   const c = makeCard(opts.title, opts.subtitle);
   const { rows, cols } = opts;
   if (rows.length === 0 || cols.length === 0) return withEmpty(c.card);
+  const disp = opts.label ?? ((d: string) => d);
+  const hasMargin = !!(opts.rowMargin && opts.colMargin);
 
   let vMin = Infinity, vMax = -Infinity;
   for (const r of rows) for (const col of cols) {
@@ -453,21 +483,28 @@ export function heatmap(opts: {
   }
   if (!isFinite(vMin)) return withEmpty(c.card);
   const span = vMax - vMin || 1;
+  const colorAt = opts.color ?? ((t: number) => ramp(t, opts.hue));
+  const shade = (v: number) => colorAt((v - vMin) / span);
 
-  const cell = 26, pad = 22;
-  const W = pad + cols.length * cell, H = pad + rows.length * cell;
+  const cell = 26, pad = 22, mGap = 8;
+  const matrixRight = pad + cols.length * cell;
+  const matrixBottom = pad + rows.length * cell;
+  const marginX = matrixRight + mGap; // coin haut-gauche de la colonne de marges
+  const marginY = matrixBottom + mGap; // coin haut-gauche de la ligne de marges
+  const W = matrixRight + (hasMargin ? mGap + cell : 0);
+  const H = matrixBottom + (hasMargin ? mGap + cell : 0);
   const svg = c.svg(W, H);
   svg.style("max-width", `${W}px`);
 
-  const xs = scaleBand(cols, [pad, W]);
-  const ys = scaleBand(rows, [pad, H]);
+  const xs = scaleBand(cols, [pad, matrixRight]);
+  const ys = scaleBand(rows, [pad, matrixBottom]);
 
   svg.append("g").selectAll("text").data(cols).join("text")
     .attr("x", (d) => xs(d)! + cell / 2).attr("y", 14).attr("fill", MUTED)
-    .attr("font-size", 11).attr("text-anchor", "middle").attr("font-family", "var(--mono)").text((d) => d);
+    .attr("font-size", 11).attr("text-anchor", "middle").attr("font-family", "var(--mono)").text((d) => disp(d));
   svg.append("g").selectAll("text").data(rows).join("text")
     .attr("x", 12).attr("y", (d) => ys(d)! + cell / 2 + 4).attr("fill", MUTED)
-    .attr("font-size", 11).attr("text-anchor", "middle").attr("font-family", "var(--mono)").text((d) => d);
+    .attr("font-size", 11).attr("text-anchor", "middle").attr("font-family", "var(--mono)").text((d) => disp(d));
 
   const cellsData: { r: string; col: string; v: number | null }[] = [];
   for (const r of rows) for (const col of cols) cellsData.push({ r, col, v: opts.value(r, col) });
@@ -475,7 +512,7 @@ export function heatmap(opts: {
   svg.append("g").selectAll("rect").data(cellsData).join("rect")
     .attr("x", (d) => xs(d.col)! + 1).attr("y", (d) => ys(d.r)! + 1)
     .attr("width", cell - 2).attr("height", cell - 2).attr("rx", 3)
-    .attr("fill", (d) => d.v === null ? "#161310" : ramp((d.v - vMin) / span, opts.hue))
+    .attr("fill", (d) => d.v === null ? "#161310" : shade(d.v))
     .style("cursor", (d) => d.v === null ? "default" : "pointer")
     .on("mousemove", function (event, d) {
       if (d.v === null) return;
@@ -484,11 +521,47 @@ export function heatmap(opts: {
     })
     .on("mouseleave", function () { select(this).attr("stroke", null); c.hideTip(); });
 
+  if (hasMargin) {
+    const hdr = opts.marginHeader ?? "Σ";
+    // en-têtes de la bande de marges
+    svg.append("text").attr("x", marginX + cell / 2).attr("y", 14).attr("fill", INK_2)
+      .attr("font-size", 11).attr("text-anchor", "middle").attr("font-family", "var(--mono)").text(hdr);
+    svg.append("text").attr("x", 12).attr("y", marginY + cell / 2 + 4).attr("fill", INK_2)
+      .attr("font-size", 11).attr("text-anchor", "middle").attr("font-family", "var(--mono)").text(hdr);
+
+    const marginCell = (
+      x: number, y: number,
+      m: { v: number | null; tip: string }
+    ) => {
+      svg.append("rect")
+        .attr("x", x + 1).attr("y", y + 1)
+        .attr("width", cell - 2).attr("height", cell - 2).attr("rx", 3)
+        .attr("fill", m.v === null ? "#161310" : shade(m.v))
+        .attr("stroke", "#3a3320").attr("stroke-width", 1)
+        .style("cursor", "pointer")
+        .on("mousemove", function (event) {
+          select(this).attr("stroke", INK).attr("stroke-width", 1.5);
+          c.showTip(event, m.tip);
+        })
+        .on("mouseleave", function () { select(this).attr("stroke", "#3a3320").attr("stroke-width", 1); c.hideTip(); });
+    };
+
+    for (const r of rows) marginCell(marginX, ys(r)!, opts.rowMargin!(r));
+    for (const col of cols) marginCell(xs(col)!, marginY, opts.colMargin!(col));
+    // coin (Σ×Σ) — légende explicative
+    svg.append("rect").attr("x", marginX + 1).attr("y", marginY + 1)
+      .attr("width", cell - 2).attr("height", cell - 2).attr("rx", 3)
+      .attr("fill", "#1c1810").attr("stroke", "#3a3320").attr("stroke-width", 1)
+      .style("cursor", "help")
+      .on("mousemove", function (event) { c.showTip(event, opts.cornerTip ?? "Marges : agrégat par ligne / colonne"); })
+      .on("mouseleave", () => c.hideTip());
+  }
+
   const wrap = document.createElement("div");
   wrap.className = "heatmap-scroll";
   wrap.append(svg.node()!);
   c.card.append(wrap);
-  c.card.append(rampLegend(vMin, vMax, opts.hue, opts.legendFormat ?? ((v) => numFmt(v))));
+  c.card.append(rampLegend(vMin, vMax, colorAt, opts.legendFormat ?? ((v) => numFmt(v))));
   return c.card;
 }
 
@@ -650,12 +723,13 @@ export function legend(items: { label: string; color: string }[]): HTMLElement {
   return box;
 }
 
-function rampLegend(min: number, max: number, hue: string, fmt: (v: number) => string): HTMLElement {
+function rampLegend(min: number, max: number, color: (t: number) => string, fmt: (v: number) => string): HTMLElement {
   const box = document.createElement("div");
   box.className = "ramp-legend";
   const bar = document.createElement("span");
   bar.className = "ramp-bar";
-  bar.style.background = `linear-gradient(to right, ${ramp(0, hue)}, ${ramp(0.5, hue)}, ${ramp(1, hue)})`;
+  const stops = [0, 0.25, 0.5, 0.75, 1].map((t) => color(t)).join(", ");
+  bar.style.background = `linear-gradient(to right, ${stops})`;
   const lo = document.createElement("span");
   lo.textContent = fmt(min);
   const hi = document.createElement("span");

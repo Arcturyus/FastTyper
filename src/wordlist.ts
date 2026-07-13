@@ -48,8 +48,12 @@ export function practicePool(
   cfg: Config,
   stats: Record<string, WordStat>
 ): PracticeCandidate[] {
+  // les stats sont partagées par famille (fr/fr1k, en/en1k) : on ne garde que les
+  // mots du pool réellement sélectionné pour cette session.
+  const pool = new Set(LANGS[lang].words);
   const candidates: PracticeCandidate[] = [];
   for (const [word, s] of Object.entries(stats)) {
+    if (!pool.has(word)) continue;
     if (s.attempts < cfg.practiceMinAttempts) continue;
     const avg = wordAvgWpm(s);
     const err = wordErrRate(s);

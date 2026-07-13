@@ -1,6 +1,6 @@
 import type { TestResult, WordResult } from "../types";
 import { LANGS } from "../wordlist";
-import { el, fmt } from "./common";
+import { el, fmt, speedPercentile, speedShade } from "./common";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -32,9 +32,9 @@ export function renderResults(
     return tile;
   };
   tiles.append(
-    mk("wpm", fmt(result.wpm), "", true),
+    mk("wpm", fmt(result.wpm, 2), "", true),
     mk("précision", fmt(result.accuracy * 100), "%"),
-    mk("brut", fmt(result.rawWpm), "wpm"),
+    mk("brut", fmt(result.rawWpm, 2), "wpm"),
     mk("durée", fmt(result.durationMs / 1000, 1), "s"),
     mk(
       "mode",
@@ -54,6 +54,12 @@ export function renderResults(
   // --- mots du test ---
   const wordsTitle = el("h3", "section-title", "Mots du test");
   root.append(wordsTitle);
+  // échelle rouge→or propre à CE test : distribution des vitesses par mot
+  const dist = result.words
+    .map(wordWpm)
+    .filter((v): v is number => v !== null)
+    .sort((a, b) => a - b);
+
   const chips = el("div", "result-words");
   const toReview = new Set<string>();
   for (const w of result.words) {
@@ -68,16 +74,33 @@ export function renderResults(
       toReview.add(w.text);
     }
     if (wpm !== null) {
-      if (wpm < result.wpm * 0.7) {
-        chip.classList.add("slow");
-        toReview.add(w.text);
-      } else if (wpm > result.wpm * 1.3) {
-        chip.classList.add("fast");
+      // même encre que le test : rouge orangé (lent) → bronze → or (rapide),
+      // calée sur la répartition des vitesses de ce test uniquement
+      if (dist.length >= 3) {
+        const { spd, redMix, gold } = speedShade(speedPercentile(wpm, dist));
+        chip.classList.add("rw-spd");
+        chip.style.setProperty("--spd", spd.toFixed(3));
+        chip.style.setProperty("--spd-red-mix", redMix.toFixed(3));
+        chip.style.setProperty("--spd-gold-mix", gold.toFixed(3));
       }
+      if (wpm < result.wpm * 0.7) toReview.add(w.text);
     }
     chips.append(chip);
   }
   root.append(chips);
+
+  // légende de l'échelle rouge→or, calée sur ce test
+  if (dist.length >= 3) {
+    const lo = dist[0] as number;
+    const hi = dist[dist.length - 1] as number;
+    const legend = el("div", "speed-legend");
+    legend.innerHTML =
+      `<span class="sl-label">${fmt(lo)}</span>` +
+      '<span class="sl-bar"></span>' +
+      `<span class="sl-label">${fmt(hi)} wpm</span>` +
+      '<span class="sl-cap">— couleur des mots = vitesse sur ce test</span>';
+    root.append(legend);
+  }
 
   // --- actions ---
   const btns = el("div", "btn-row");

@@ -4,16 +4,18 @@ import {
   appendTestLog,
   applyResult,
   loadWordStats,
-  recentAvgWpm,
+  okWpmMedianByWord,
+  paceTargetWpm,
+  wordAvgWpm,
+  wordErrRate,
   wordPosErrorRates,
 } from "../store";
 import { generatePractice, generateWords, LANGS } from "../wordlist";
 import type { Config, LangId, TestMode, TestWord, WordStat } from "../types";
 
-// seuils du marqueur « couture » entre deux lettres en mode entraînement
-const SEAM_FLOOR = 0.12; // en dessous de ce taux d'erreur, on n'affiche rien
-const SEAM_FULL = 0.5; // à ce taux, intensité maximale
-import { el, fmt, toast, wordClasses } from "./common";
+// intensité minimale d'un trait de soulignage coloré (pour rester visible)
+const ERR_MARK_FLOOR = 0.28;
+import { el, fmt, speedPercentile, speedShade, toast } from "./common";
 import { renderResults } from "./results-view";
 
 const WORD_COUNTS = [10, 25, 50];
@@ -23,6 +25,8 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
   let mode: TestMode = "normal";
   let engine: TestEngine;
   let stats: Record<string, WordStat> = {};
+  let okSpeeds = new Map<string, number>(); // vitesse hors erreur par mot
+  let speedDist: number[] = []; // vitesses triées de tes mots, pour l'échelle
   let wordEls: HTMLElement[] = [];
   let liveTimer: number | undefined;
   let paceRaf = 0;
@@ -44,10 +48,27 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
   // le curseur de rythme est enfant de wordsWrap (survit au re-render de wordsEl)
   wordsWrap.append(wordsEl, paceCaret, focusHint);
   const footer = el("div", "test-footer");
+  const speedLegend = el("div", "speed-legend");
+  speedLegend.hidden = true;
+  function renderSpeedLegend(): void {
+    const show =
+      cfg.hints &&
+      (cfg.colorBy === "speed" || cfg.colorBy === "both") &&
+      speedDist.length >= 5;
+    speedLegend.hidden = !show;
+    if (!show) return;
+    const lo = speedDist[0] as number;
+    const hi = speedDist[speedDist.length - 1] as number;
+    speedLegend.innerHTML =
+      `<span class="sl-label">${fmt(lo)}</span>` +
+      '<span class="sl-bar"></span>' +
+      `<span class="sl-label">${fmt(hi)} wpm</span>` +
+      '<span class="sl-cap">— couleur des mots = vitesse (répartie sur tes mots)</span>';
+  }
   const practiceLegend = el("div", "practice-legend");
   practiceLegend.innerHTML =
-    '<span class="seam-swatch"></span> zone rouge entre deux lettres = ' +
-    "endroit où tu te trompes le plus (plus c'est vif, plus tu rates)";
+    '<span class="err-swatch">e</span> soulignement rouge sous une lettre = ' +
+    "endroit où tu te trompes le plus (plus c'est épais, plus tu rates)";
   practiceLegend.hidden = true;
   function renderFooter(): void {
     footer.innerHTML =
@@ -63,7 +84,9 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
   input.setAttribute("autocomplete", "off");
 
   const testScreen = el("div");
-  testScreen.append(controls, liveStats, wordsWrap, practiceLegend, footer, input);
+  testScreen.append(
+    controls, liveStats, wordsWrap, speedLegend, practiceLegend, footer, input
+  );
   const resultScreen = el("div");
   resultScreen.hidden = true;
   root.append(testScreen, resultScreen);
@@ -109,14 +132,32 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     controls.append(practiceBtn);
 
     controls.append(el("span", "sep", "|"));
+    const hintsBtn = el("button", "chip-btn", "💡 Indices");
+    if (cfg.hints) hintsBtn.classList.add("on");
+    hintsBtn.title =
+      "Affiche ou masque les indices : surlignage vitesse et soulignage des fautes. " +
+      "Masqués, ils ne biaisent plus ta frappe (voir l'onglet Biais).";
+    hintsBtn.addEventListener("click", () => {
+      cfg.hints = !cfg.hints;
+      saveConfig(cfg);
+      renderControls();
+      renderSpeedLegend();
+      renderAllWords();
+    });
+    controls.append(hintsBtn);
+
+    controls.append(el("span", "sep", "|"));
+    // en entraînement, la cible est la médiane de tes entraînements (pas des tests normaux)
+    const paceName = mode === "practice" ? "⏱ Rythme entraînement" : "⏱ Rythme";
+    const paceKind = mode === "practice" ? "entraînements" : "tests";
     const paceLabel =
-      paceWpm !== null ? `⏱ Rythme ${fmt(paceWpm)}` : "⏱ Rythme";
+      paceWpm !== null ? `${paceName} ${fmt(paceWpm)}` : paceName;
     const paceBtn = el("button", "chip-btn", paceLabel);
     if (cfg.paceCaret) paceBtn.classList.add("on");
     paceBtn.title =
       paceWpm !== null
-        ? `Curseur fantôme avançant à ta moyenne des ${cfg.paceAvgCount} derniers tests (${fmt(paceWpm)} wpm)`
-        : "Curseur fantôme à ta vitesse moyenne — fais d'abord quelques tests dans cette langue";
+        ? `Curseur fantôme avançant à ta vitesse médiane sur tes ${cfg.paceAvgCount} derniers ${paceKind} (${fmt(paceWpm)} wpm)`
+        : `Curseur fantôme à ta vitesse médiane — fais d'abord quelques ${paceKind} dans cette langue`;
     paceBtn.addEventListener("click", () => {
       cfg.paceCaret = !cfg.paceCaret;
       saveConfig(cfg);
@@ -161,6 +202,7 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
       mode: engine.mode,
       pace: paceActive(),
       paceWpm: paceActive() ? paceWpm : null,
+      hints: cfg.hints && cfg.colorBy !== "off",
       wordCount: engine.words.length,
       completed,
       words: attempts.map((a) => ({
@@ -185,13 +227,16 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     flushPartial();
     cfg = loadConfig();
     stats = loadWordStats(cfg.lang);
+    okSpeeds = okWpmMedianByWord(cfg.lang);
+    buildSpeedDist();
     engine = new TestEngine(buildWordList(), cfg.lang, mode);
     logged = false;
-    paceWpm = recentAvgWpm(cfg.lang, cfg.paceAvgCount);
+    paceWpm = paceTargetWpm(cfg.lang, cfg.paceAvgCount, mode);
     resultScreen.hidden = true;
     testScreen.hidden = false;
     renderControls();
     renderFooter();
+    renderSpeedLegend();
     renderAllWords();
     updateLive();
     window.clearInterval(liveTimer);
@@ -207,9 +252,7 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     wordEls = [];
     for (let i = 0; i < engine.words.length; i++) {
       const wordEl = el("span", "word");
-      for (const c of wordClasses(stats[engine.words[i]!.text], cfg)) {
-        wordEl.classList.add(c);
-      }
+      decorateSpeed(wordEl, engine.words[i]!.text);
       wordsEl.append(wordEl, document.createTextNode(" "));
       wordEls.push(wordEl);
       renderWord(i);
@@ -217,14 +260,76 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     scrollToActive();
   }
 
-  /** Intensités 0..1 des coutures d'erreur par position (mode entraînement) */
-  function seamIntensities(word: TestWord): number[] | null {
-    if (mode !== "practice") return null;
+  /** Vitesse retenue d'un mot : hors erreur si dispo, sinon moyenne globale. */
+  function wordSpeed(text: string, stat: WordStat): number | null {
+    return okSpeeds.get(text) ?? wordAvgWpm(stat);
+  }
+
+  /** Distribution triée des vitesses de tes mots (assez joués), pour l'échelle. */
+  function buildSpeedDist(): void {
+    speedDist = [];
+    for (const [word, stat] of Object.entries(stats)) {
+      if (stat.attempts < cfg.minAttempts) continue;
+      const wpm = wordSpeed(word, stat);
+      if (wpm !== null) speedDist.push(wpm);
+    }
+    speedDist.sort((a, b) => a - b);
+  }
+
+  /**
+   * Surlignage continu : teinte de l'encre du mot d'après son RANG de vitesse
+   * dans ta distribution (pas les seuils de réglage). Presque tout reste bronze,
+   * du bronze foncé (lent) au bronze cuivré (rapide) ; seul le top ~1 % vire à l'or.
+   */
+  function decorateSpeed(node: HTMLElement, text: string): void {
+    if (!cfg.hints) return;
+    if (cfg.colorBy !== "speed" && cfg.colorBy !== "both") return;
+    if (speedDist.length < 5) return; // pas assez de mots pour une échelle fiable
+    const stat = stats[text];
+    if (!stat || stat.attempts < cfg.minAttempts) return;
+    const wpm = wordSpeed(text, stat);
+    if (wpm === null) return;
+    const pct = speedPercentile(wpm, speedDist);
+    const { spd, redMix, gold } = speedShade(pct);
+    node.classList.add("w-spd");
+    node.style.setProperty("--spd", spd.toFixed(3));
+    node.style.setProperty("--spd-red-mix", redMix.toFixed(3));
+    node.style.setProperty("--spd-gold-mix", gold.toFixed(3));
+  }
+
+  /**
+   * Intensités 0..1 du soulignage rouge en mode entraînement : taux de faute par
+   * position, relatif au pire endroit du mot. Même langage visuel que le mode
+   * « à risque » (soulignement, pas de halo). Ne s'affiche que sur les mots déjà
+   * un peu joués.
+   */
+  function practiceUnderline(word: TestWord): number[] | null {
+    if (!cfg.hints || mode !== "practice") return null;
     const stat = stats[word.text];
     if (!stat || stat.attempts < 2) return null;
     const rates = wordPosErrorRates(stat, word.text.length);
+    const worst = Math.max(0, ...rates);
+    if (worst <= 0) return null;
+    return rates.map((r) => (r <= 0 ? 0 : Math.max(ERR_MARK_FLOOR, r / worst)));
+  }
+
+  /**
+   * Intensités 0..1 du soulignage coloré par bigramme, pour les mots repérés
+   * « à risque » (taux d'erreur ≥ seuil). Chaque position p correspond au
+   * bigramme (lettre p-1 → lettre p) ; l'intensité est relative au pire endroit
+   * du mot pour montrer d'un coup d'œil où se concentrent les fautes.
+   */
+  function errIntensities(word: TestWord): number[] | null {
+    if (!cfg.hints) return null;
+    if (cfg.colorBy !== "errors" && cfg.colorBy !== "both") return null;
+    const stat = stats[word.text];
+    if (!stat || stat.attempts < cfg.minAttempts) return null;
+    if (wordErrRate(stat) < cfg.errWarnRate) return null;
+    const rates = wordPosErrorRates(stat, word.text.length);
+    const worst = Math.max(0, ...rates);
+    if (worst <= 0) return rates.map(() => 0.55); // fautes hors position → uniforme
     return rates.map((r) =>
-      r < SEAM_FLOOR ? 0 : Math.min(1, r / SEAM_FULL)
+      r <= 0 ? 0 : Math.max(ERR_MARK_FLOOR, r / worst)
     );
   }
 
@@ -235,23 +340,33 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     node.innerHTML = "";
     const isActive = i === engine.index && !engine.finished;
     const len = Math.max(word.text.length, word.typed.length);
-    const seams = seamIntensities(word);
+    // En entraînement, le soulignage rouge marque les positions les plus fautées ;
+    // sinon, il marque les bigrammes à risque. Même rendu visuel (err-mark).
+    const practiceMarks = practiceUnderline(word);
+    const errs = practiceMarks ?? errIntensities(word);
+    const posBased = practiceMarks !== null;
     for (let p = 0; p < len; p++) {
       const expected = word.text[p];
       const state = word.states[p];
       const letter = el("span", "letter", expected ?? word.typed[p] ?? "");
       if (p < word.typed.length && state) letter.classList.add(state);
       if (isActive && p === word.typed.length) letter.classList.add("caret");
-      // couture d'erreur à la transition entrant dans la lettre p
-      const intensity = seams?.[p] ?? 0;
-      if (intensity > 0) {
-        letter.classList.add("seam");
-        letter.style.setProperty("--seam-i", intensity.toFixed(3));
+      // soulignage rouge, uniquement sur les lettres pas encore tapées (une fois
+      // tapée, l'état réel de la frappe reprend la main)
+      const errI = errs?.[p] ?? 0;
+      if (errI > 0 && p >= word.typed.length) {
+        letter.classList.add("err-mark");
+        letter.style.setProperty("--err-i", errI.toFixed(3));
         const st = stats[word.text];
         const pct = Math.round(
           ((st?.posErrors?.[p] ?? 0) / Math.max(1, st?.attempts ?? 1)) * 100
         );
-        letter.title = `${pct} % d'erreurs à cet endroit`;
+        if (posBased) {
+          letter.title = `${pct} % d'erreurs à cet endroit`;
+        } else {
+          const prev = p === 0 ? "␣" : word.text[p - 1];
+        letter.title = `bigramme « ${prev}${expected ?? ""} » — ${pct} % d'erreurs`;
+        }
       }
       node.append(letter);
     }

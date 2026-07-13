@@ -15,6 +15,7 @@ import {
   wordErrRate,
   wordPosErrorRates,
   wordOutcomeSpeeds,
+  wordTrials,
 } from "../store";
 import type { OutcomeSpeed, TaggedWord } from "../store";
 import type {
@@ -23,8 +24,10 @@ import type {
   HistoryEntry,
   LangId,
   TestLog,
+  TestMode,
   WordStat,
 } from "../types";
+import { ALL_FAMILIES, FAMILY_LABEL, FAMILY_OF, type LangFamily } from "../lang";
 import { LANGS } from "../wordlist";
 import { practicePool } from "../wordlist";
 import { el, fmt, fmtPct, toast, wordClasses } from "./common";
@@ -42,22 +45,27 @@ import {
   progressionChart,
   ramp,
   scatterChart,
+  speedRamp,
   stats as summary,
 } from "./charts";
 
-/** Couleur fixe par langue pour la coloration « par langue ». */
-const LANG_COLOR: Record<LangId, string> = {
+/** Couleur fixe par famille de langue pour la coloration « par langue ». */
+const FAMILY_COLOR: Record<LangFamily, string> = {
   fr: ACCENT,
-  fr1k: STATUS.warning,
   en: PACE,
-  en1k: STATUS.good,
 };
 
-/** Ligne d'analyse par mot, agrégée sur une (langue, mot). */
+/** Modes filtrables dans l'en-tête — couleurs alignées sur les graphiques. */
+const MODE_FILTERS: { key: TestMode; label: string; color: string }[] = [
+  { key: "normal", label: "normal", color: ACCENT },
+  { key: "practice", label: "entraînement", color: STATUS.serious },
+];
+
+/** Ligne d'analyse par mot, agrégée sur une (famille de langue, mot). */
 type WordRow = {
-  lang: LangId;
+  family: LangFamily;
   word: string;
-  key: string; // `${lang} ${word}`, identifiant unique
+  key: string; // `${family} ${word}`, identifiant unique
   stat: WordStat;
   attempts: number;
   wpmAll: number | null; // vitesse tous essais chronométrés
@@ -71,11 +79,11 @@ type WordRow = {
 
 /** Construit les lignes d'analyse en croisant WordStat et la ventilation d'issue. */
 function buildWordRows(tagged: TaggedWord[], outcome: Map<string, OutcomeSpeed>): WordRow[] {
-  return tagged.map(({ lang, word, stat }) => {
-    const key = `${lang} ${word}`;
+  return tagged.map(({ family, word, stat }) => {
+    const key = `${family} ${word}`;
     const o = outcome.get(key);
     return {
-      lang,
+      family,
       word,
       key,
       stat,
@@ -105,9 +113,11 @@ const TABS: { key: Tab; label: string }[] = [
 export function mountStatsView(root: HTMLElement, signal: AbortSignal): void {
   const cfg = loadConfig();
   // état local (n'altère pas la config globale)
-  const selectedLangs = new Set<LangId>(ALL_LANGS);
+  const selectedFamilies = new Set<LangFamily>(ALL_FAMILIES);
+  const selectedModes = new Set<TestMode>(MODE_FILTERS.map((m) => m.key));
   let tab: Tab = "progression";
-  let range = 0; // 0 = tout, sinon N derniers tests
+  // état de l'onglet Progression, conservé entre deux re-rendus
+  const progState = { range: 0, maWin: 0 }; // range : 0 = tout · maWin : 0 = auto
 
   root.innerHTML = "";
 
@@ -115,32 +125,59 @@ export function mountStatsView(root: HTMLElement, signal: AbortSignal): void {
   const header = el("div", "stats-header");
   header.append(el("h2", "page-title", "Statistiques"));
 
-  // barre de langues (multi-sélection, au moins une active)
+  // barre de langues (multi-sélection, au moins une active) — une pastille par
+  // famille : fr et fr1k (resp. en et en1k) partagent déjà les mêmes données.
   const langBar = el("div", "lang-filter");
   langBar.append(el("span", "lang-filter-label", "Langues"));
-  const langPills = new Map<LangId, HTMLElement>();
-  for (const id of ALL_LANGS) {
-    const pill = el("button", "pill on", LANGS[id].label);
-    pill.style.setProperty("--lang-dot", LANG_COLOR[id]);
+  const familyPills = new Map<LangFamily, HTMLElement>();
+  for (const family of ALL_FAMILIES) {
+    const pill = el("button", "pill on", FAMILY_LABEL[family]);
+    pill.style.setProperty("--lang-dot", FAMILY_COLOR[family]);
     pill.classList.add("lang-pill");
     pill.addEventListener(
       "click",
       () => {
-        if (selectedLangs.has(id)) {
-          if (selectedLangs.size === 1) return; // garde-fou : au moins une langue
-          selectedLangs.delete(id);
+        if (selectedFamilies.has(family)) {
+          if (selectedFamilies.size === 1) return; // garde-fou : au moins une famille
+          selectedFamilies.delete(family);
         } else {
-          selectedLangs.add(id);
+          selectedFamilies.add(family);
         }
-        pill.classList.toggle("on", selectedLangs.has(id));
+        pill.classList.toggle("on", selectedFamilies.has(family));
         renderTab();
       },
       { signal }
     );
-    langPills.set(id, pill);
+    familyPills.set(family, pill);
     langBar.append(pill);
   }
   header.append(langBar);
+
+  // barre de modes (multi-sélection, au moins un actif) : les entraînements
+  // ciblés tirent la moyenne vers le bas, on peut donc les écarter d'un clic.
+  // Sans effet sur Mots/Bigrammes (données agrégées tous modes) : masquée là-bas.
+  const modeBar = el("div", "lang-filter");
+  modeBar.append(el("span", "lang-filter-label", "Modes"));
+  for (const m of MODE_FILTERS) {
+    const pill = el("button", "pill on lang-pill", m.label);
+    pill.style.setProperty("--lang-dot", m.color);
+    pill.addEventListener(
+      "click",
+      () => {
+        if (selectedModes.has(m.key)) {
+          if (selectedModes.size === 1) return; // garde-fou : au moins un mode
+          selectedModes.delete(m.key);
+        } else {
+          selectedModes.add(m.key);
+        }
+        pill.classList.toggle("on", selectedModes.has(m.key));
+        renderTab();
+      },
+      { signal }
+    );
+    modeBar.append(pill);
+  }
+  header.append(modeBar);
   root.append(header);
 
   // --- barre d'onglets ---
@@ -166,23 +203,34 @@ export function mountStatsView(root: HTMLElement, signal: AbortSignal): void {
 
   function renderTab(): void {
     for (const [key, btn] of tabBtns) btn.classList.toggle("active", key === tab);
+    // le filtre de mode ne s'applique qu'aux données qui gardent le mode
+    modeBar.style.display = tab === "mots" || tab === "bigrammes" ? "none" : "";
     content.innerHTML = "";
-    const langs = ALL_LANGS.filter((l) => selectedLangs.has(l));
-    const tagged = loadWordStatsTagged(langs);
-    const history = loadHistory().filter((h) => selectedLangs.has(h.lang));
+    const families = ALL_FAMILIES.filter((f) => selectedFamilies.has(f));
+    // variantes couvertes (fr+fr1k, en+en1k) : sert au journal brut, qui garde le détail par pool
+    const langs = ALL_LANGS.filter((l) => selectedFamilies.has(FAMILY_OF[l]));
+    const tagged = loadWordStatsTagged(families);
+    const history = loadHistory().filter(
+      (h) => selectedFamilies.has(FAMILY_OF[h.lang]) && selectedModes.has(h.mode)
+    );
 
     switch (tab) {
       case "progression":
-        renderProgression(content, cfg, history, tagged, () => range, (r) => (range = r), renderTab, signal);
+        renderProgression(content, cfg, history, tagged, progState, renderTab, signal);
         break;
       case "mots":
-        renderWords(content, cfg, langs, tagged, loadTestLogMulti(langs), signal);
+        renderWords(content, cfg, families, tagged, loadTestLogMulti(families), signal);
         break;
       case "biais":
-        renderBias(content, loadTestLogMulti(langs), langs.length > 1, signal);
+        renderBias(
+          content,
+          loadTestLogMulti(families).filter((t) => selectedModes.has(t.mode)),
+          langs.length > 1,
+          signal
+        );
         break;
       case "bigrammes":
-        renderBigrams(content, loadBigramStatsMerged(langs));
+        renderBigrams(content, loadBigramStatsMerged(families));
         break;
       case "activite":
         renderActivity(content, history, root, signal);
@@ -200,23 +248,22 @@ function renderProgression(
   cfg: Config,
   fullHistory: HistoryEntry[],
   tagged: TaggedWord[],
-  getRange: () => number,
-  setRange: (r: number) => void,
+  state: { range: number; maWin: number },
   rerender: () => void,
   signal: AbortSignal
 ): void {
   if (fullHistory.length === 0) {
-    root.append(el("div", "empty-note", "Aucun test enregistré pour les langues sélectionnées — lance-toi !"));
+    root.append(el("div", "empty-note", "Aucun test enregistré pour les langues et modes sélectionnés — lance-toi !"));
     return;
   }
-  const range = getRange();
-  const history = range > 0 ? fullHistory.slice(-range) : fullHistory;
+  const history = state.range > 0 ? fullHistory.slice(-state.range) : fullHistory;
 
   // --- tuiles de synthèse ---
   const wpms = history.map((h) => h.wpm);
   const stat = summary(wpms);
   const best = Math.max(...fullHistory.map((h) => h.wpm));
   const recent = fullHistory.slice(-10);
+  const recentStat = summary(recent.map((h) => h.wpm));
   const avgRecent = recent.reduce((s, h) => s + h.wpm, 0) / recent.length;
   const avgAcc = history.reduce((s, h) => s + h.accuracy, 0) / history.length;
   const totalMs = fullHistory.reduce((s, h) => s + h.durationMs, 0);
@@ -232,6 +279,7 @@ function renderProgression(
   cards.append(
     mk("tests", fmt(fullHistory.length)),
     mk("wpm moyen", fmt(avgRecent), "10 derniers"),
+    mk("wpm médian", recentStat ? fmt(recentStat.median) : "—", "10 derniers"),
     mk("record", fmt(best)),
     mk("précision", fmtPct(avgAcc)),
     mk("régularité", stat ? "± " + fmt(stat.sd) : "—", "écart-type wpm"),
@@ -249,44 +297,61 @@ function renderProgression(
     { label: "tout", value: 0 },
   ];
   for (const r of ranges) {
-    const btn = el("button", "pill" + (getRange() === r.value ? " on" : ""), r.label);
-    btn.addEventListener("click", () => { setRange(r.value); rerender(); }, { signal });
+    const btn = el("button", "pill" + (state.range === r.value ? " on" : ""), r.label);
+    btn.addEventListener("click", () => { state.range = r.value; rerender(); }, { signal });
     filters.append(btn);
+  }
+
+  // --- progression wpm (fenêtre de moyenne mobile réglable) ---
+  const maxWin = Math.min(200, history.length);
+  const autoWin = Math.max(3, Math.round(history.length / 12));
+  let win = Math.max(2, Math.min(state.maWin > 0 ? state.maWin : autoWin, maxWin));
+  if (maxWin > 2) {
+    filters.append(
+      slider("moyenne mobile", win, 2, maxWin, 1, (v) => { win = v; state.maWin = v; drawProg(); }, (v) => fmt(v), signal)
+    );
   }
   root.append(filters);
 
-  // --- progression wpm ---
-  root.append(
-    progressionChart({
-      title: "Progression du WPM",
-      subtitle: `${history.length} test(s)`,
-      points: history.map((h) => ({
-        y: h.wpm,
-        category: h.mode,
-        label: `<span class="t-dim">${fmtDate(h.date)} · ${fmtPct(h.accuracy)} · ${h.mode === "practice" ? "entraînement" : "normal"}</span>`,
-      })),
-      categories: [
-        { key: "normal", label: "normal", color: ACCENT },
-        { key: "practice", label: "entraînement", color: STATUS.serious },
-      ],
-    })
-  );
+  const progCats = MODE_FILTERS.filter((m) => history.some((h) => h.mode === m.key))
+    .map((m) => ({ key: m.key as string, label: m.label, color: m.color }));
+  const progHost = el("div");
+  root.append(progHost);
+  function drawProg(): void {
+    progHost.innerHTML = "";
+    progHost.append(
+      progressionChart({
+        title: "Progression du WPM",
+        subtitle: `${history.length} test(s)`,
+        points: history.map((h) => ({
+          y: h.wpm,
+          category: h.mode,
+          label: `<span class="t-dim">${fmtDate(h.date)} · ${fmtPct(h.accuracy)} · ${h.mode === "practice" ? "entraînement" : "normal"}</span>`,
+        })),
+        categories: progCats,
+        maWindow: win,
+      })
+    );
+  }
+  drawProg();
 
   // --- distribution ---
   if (stat) {
     root.append(
       histogramChart({
         title: "Distribution du WPM",
-        subtitle: `médiane ${fmt(stat.median)} · Q1 ${fmt(stat.q1)} · Q3 ${fmt(stat.q3)}`,
+        subtitle: `moyenne ${fmt(stat.mean)} · médiane ${fmt(stat.median)} · Q1 ${fmt(stat.q1)} · Q3 ${fmt(stat.q3)}`,
         values: wpms,
         unit: "wpm",
         markers: [
           { value: stat.q1, label: "Q1", color: STATUS.warning },
           { value: stat.median, label: "méd.", color: ACCENT },
+          { value: stat.mean, label: "moy.", color: PACE },
           { value: stat.q3, label: "Q3", color: STATUS.good },
         ],
       })
     );
+    root.append(meanMedianNote(stat.mean, stat.median));
   }
 
   // --- vitesse vs précision ---
@@ -326,10 +391,13 @@ function renderProgression(
 // ===========================================================================
 //  Onglet Mots
 // ===========================================================================
+/** Variante « grand pool » de chaque famille — sert d'affichage sans exclure de mots. */
+const WIDE_VARIANT: Record<LangFamily, LangId> = { fr: "fr1k", en: "en1k" };
+
 function renderWords(
   root: HTMLElement,
   cfg: Config,
-  langs: LangId[],
+  families: LangFamily[],
   tagged: TaggedWord[],
   logs: TestLog[],
   signal: AbortSignal
@@ -340,23 +408,32 @@ function renderWords(
   }
   const outcome = wordOutcomeSpeeds(logs);
   const rows = buildWordRows(tagged, outcome);
-  const multiLang = langs.length > 1;
+  const multiFamily = families.length > 1;
 
-  // le tableau expose une fonction de surbrillance, câblée au clic sur la carto
-  const table = buildWordTable(cfg, rows, multiLang, signal);
+  // panneau d'évolution d'un mot, rempli au clic sur la carto ou le tableau
+  const timeline = buildWordTimeline(logs, multiFamily, signal);
+
+  // le tableau expose une surbrillance + un clic-mot, câblés à la carto/timeline
+  const table = buildWordTable(cfg, rows, multiFamily, (key) => timeline.show(key), signal);
 
   // --- cartographie interactive ---
-  root.append(buildCartography(cfg, rows, multiLang, langs, (key) => table.focus(key), signal));
+  root.append(
+    buildCartography(cfg, rows, multiFamily, families, (key) => { table.focus(key); timeline.show(key); }, signal)
+  );
+
+  // --- évolution du mot sélectionné (clic sur la carto ci-dessus ou le tableau) ---
+  root.append(timeline.box);
 
   // --- vitesse réussite vs échec ---
-  renderOutcomeSpeed(root, rows, multiLang);
+  renderOutcomeSpeed(root, rows, multiFamily);
 
-  // --- top mots à travailler (agrégé sur les langues sélectionnées) ---
-  const pool = langs
-    .flatMap((l) => {
+  // --- top mots à travailler (agrégé sur les familles sélectionnées) ---
+  const pool = families
+    .flatMap((f) => {
       const rec: Record<string, WordStat> = {};
-      for (const r of rows) if (r.lang === l) rec[r.word] = r.stat;
-      return practicePool(l, cfg, rec).map((p) => ({ ...p, lang: l }));
+      for (const r of rows) if (r.family === f) rec[r.word] = r.stat;
+      // on affiche depuis le plus grand pool de la famille pour ne rien exclure
+      return practicePool(WIDE_VARIANT[f], cfg, rec).map((p) => ({ ...p, family: f }));
     })
     .sort((a, b) => b.score - a.score)
     .slice(0, 12);
@@ -370,7 +447,7 @@ function renderWords(
           value: p.score,
           mono: true,
           tint: ramp(0.4 + 0.6 * Math.min(1, p.score / 2), STATUS.critical),
-          sub: `${multiLang ? LANGS[p.lang].label.split(" ")[0] + " · " : ""}${p.avgWpm === null ? "—" : fmt(p.avgWpm)} wpm · ${fmtPct(p.errRate)}`,
+          sub: `${multiFamily ? FAMILY_LABEL[p.family] + " · " : ""}${p.avgWpm === null ? "—" : fmt(p.avgWpm)} wpm · ${fmtPct(p.errRate)}`,
         })),
         format: (v) => fmt(v, 2),
       })
@@ -406,8 +483,8 @@ function renderWords(
 function buildCartography(
   cfg: Config,
   rows: WordRow[],
-  multiLang: boolean,
-  langs: LangId[],
+  multiFamily: boolean,
+  families: LangFamily[],
   onPick: (key: string) => void,
   signal: AbortSignal
 ): HTMLElement {
@@ -457,14 +534,14 @@ function buildCartography(
         const isSlow = d.x! <= slow;
         const faulty = d.r.errRate >= err;
         const quad = isSlow && faulty ? STATUS.critical : faulty ? STATUS.serious : isSlow ? STATUS.warning : STATUS.good;
-        const langLabel = multiLang ? `<br><span class="t-dim">${LANGS[d.r.lang].label}</span>` : "";
+        const langLabel = multiFamily ? `<br><span class="t-dim">${FAMILY_LABEL[d.r.family]}</span>` : "";
         const okTip = d.r.okWpm !== null ? ` · ✓ ${fmt(d.r.okWpm)}` : "";
         const badTip = d.r.badWpm !== null ? ` · ✗ ${fmt(d.r.badWpm)}` : "";
         return {
           x: d.x!,
           y: d.r.errRate * 100,
           r: Math.min(3, Math.log2(d.r.attempts + 1) / 2),
-          tint: color === "lang" ? LANG_COLOR[d.r.lang] : quad,
+          tint: color === "lang" ? FAMILY_COLOR[d.r.family] : quad,
           key: d.r.key,
           tip: `<b class="mono">${d.r.word}</b>${langLabel}<br><span class="t-dim">${fmt(d.x!)} wpm${okTip}${badTip} · ${fmtPct(d.r.errRate)} fautés · ${d.r.attempts} essais</span>`,
         };
@@ -491,8 +568,8 @@ function buildCartography(
       })
     );
 
-    if (color === "lang" && multiLang) {
-      host.append(legend(langs.map((l) => ({ label: LANGS[l].label, color: LANG_COLOR[l] }))));
+    if (color === "lang" && multiFamily) {
+      host.append(legend(families.map((f) => ({ label: FAMILY_LABEL[f], color: FAMILY_COLOR[f] }))));
     }
   }
   draw();
@@ -500,10 +577,122 @@ function buildCartography(
 }
 
 /**
+ * Panneau d'évolution d'un mot précis. Rempli à la demande (clic sur la carto ou
+ * sur un mot du tableau) : trace, essai après essai, la vitesse et le nombre de
+ * fautes, lissés en moyenne mobile large pour dégager la tendance de fond —
+ * pratique pour juger l'effet des entraînements. Les points sont teintés selon
+ * le mode (normal vs entraînement).
+ */
+function buildWordTimeline(
+  logs: TestLog[],
+  multiFamily: boolean,
+  signal: AbortSignal
+): { box: HTMLElement; show: (key: string) => void } {
+  const box = el("div", "carto-block");
+  const hint = el(
+    "div",
+    "empty-note",
+    "Clique sur un mot — dans la cartographie ci-dessus ou le tableau plus bas — pour suivre l'évolution de sa vitesse et de ses fautes essai après essai (moyenne mobile large)."
+  );
+  const host = el("div");
+  box.append(hint, host);
+
+  const cats = [
+    { key: "normal", label: "normal", color: ACCENT },
+    { key: "practice", label: "entraînement", color: STATUS.serious },
+  ];
+  const modeLabel = (m: TestLog["mode"]) => (m === "practice" ? "entraînement" : "normal");
+
+  const show = (key: string): void => {
+    const sp = key.indexOf(" ");
+    const family = key.slice(0, sp) as LangFamily;
+    const word = key.slice(sp + 1);
+    const trials = wordTrials(logs, family, word);
+
+    hint.style.display = "none";
+    host.innerHTML = "";
+    const title = `Évolution de « ${word} »` + (multiFamily ? ` · ${FAMILY_LABEL[family]}` : "");
+    host.append(el("h3", "section-title", title));
+
+    if (trials.length < 2) {
+      host.append(
+        el("div", "empty-note", `Pas encore assez d'essais sur « ${word} » pour tracer une évolution — il en faut au moins 2.`)
+      );
+      box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      return;
+    }
+
+    const timed = trials.filter((t) => t.wpm !== null);
+    const n = trials.length;
+    const first = trials[0]!;
+    const last = trials[trials.length - 1]!;
+    host.append(
+      el(
+        "div",
+        "empty-note",
+        `${fmt(n)} essai(s) du ${fmtDate(first.date)} au ${fmtDate(last.date)}` +
+          ` · ${fmt(timed.length)} chronométré(s).`
+      )
+    );
+
+    // fenêtre de moyenne mobile : base 10, poussée à 50 quand il y a de quoi.
+    const maxWin = Math.max(2, n);
+    let win = Math.min(n >= 50 ? 50 : 10, maxWin);
+
+    const charts = el("div");
+    const draw = (): void => {
+      charts.innerHTML = "";
+      charts.append(
+        progressionChart({
+          title: "Vitesse au fil des essais",
+          subtitle: `${fmt(timed.length)} essai(s) chronométré(s) · moyenne mobile ${fmt(win)}`,
+          points: timed.map((t) => ({
+            y: t.wpm!,
+            category: t.mode,
+            label: `<span class="t-dim">${fmtDate(t.date)} · ${modeLabel(t.mode)}${t.faulted ? " · fauté" : ""}</span>`,
+          })),
+          categories: cats,
+          yFormat: (v) => fmt(v) + " wpm",
+          maWindow: win,
+        })
+      );
+      charts.append(
+        progressionChart({
+          title: "Fautes au fil des essais",
+          subtitle: `frappes fausses par essai · moyenne mobile ${fmt(win)}`,
+          points: trials.map((t) => ({
+            y: t.errors,
+            category: t.mode,
+            label: `<span class="t-dim">${fmtDate(t.date)} · ${modeLabel(t.mode)}</span>`,
+          })),
+          categories: cats,
+          yFormat: (v) => fmt(v, 1),
+          maWindow: win,
+        })
+      );
+    };
+
+    // curseur de réglage de la fenêtre (seulement si on a de quoi la varier)
+    if (maxWin > 2) {
+      const controls = el("div", "carto-controls");
+      controls.append(
+        slider("moyenne mobile", win, 2, maxWin, 1, (v) => { win = v; draw(); }, (v) => fmt(v), signal)
+      );
+      host.append(controls);
+    }
+    host.append(charts);
+    draw();
+    box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  };
+
+  return { box, show };
+}
+
+/**
  * Section « vitesse : réussite vs échec ». Croise, par mot, la vitesse quand on
  * le tape juste et la vitesse quand on le tape en entier mais fauté.
  */
-function renderOutcomeSpeed(root: HTMLElement, rows: WordRow[], multiLang: boolean): void {
+function renderOutcomeSpeed(root: HTMLElement, rows: WordRow[], multiFamily: boolean): void {
   const data = rows
     .filter((r) => r.okWpm !== null && r.badWpm !== null && r.okN >= 2 && r.badN >= 1)
     .map((r) => ({ ...r, gap: r.okWpm! - r.badWpm! }));
@@ -539,7 +728,7 @@ function renderOutcomeSpeed(root: HTMLElement, rows: WordRow[], multiLang: boole
         y: d.badWpm!,
         r: Math.min(3, Math.log2(d.okN + d.badN + 1) / 2),
         tint: d.gap > 0 ? STATUS.warning : STATUS.good,
-        tip: `<b class="mono">${d.word}</b>${multiLang ? `<br><span class="t-dim">${LANGS[d.lang].label}</span>` : ""}<br><span class="t-dim">✓ ${fmt(d.okWpm!)} · ✗ ${fmt(d.badWpm!)} wpm · écart ${fmt(d.gap)}</span>`,
+        tip: `<b class="mono">${d.word}</b>${multiFamily ? `<br><span class="t-dim">${FAMILY_LABEL[d.family]}</span>` : ""}<br><span class="t-dim">✓ ${fmt(d.okWpm!)} · ✗ ${fmt(d.badWpm!)} wpm · écart ${fmt(d.gap)}</span>`,
       })),
       xLabel: "WPM en réussite",
       yLabel: "WPM en échec",
@@ -591,7 +780,8 @@ function aggregatePositions(stats: WordStat[]): number[] {
 function buildWordTable(
   cfg: Config,
   allRows: WordRow[],
-  multiLang: boolean,
+  multiFamily: boolean,
+  onWord: (key: string) => void,
   signal: AbortSignal
 ): { box: HTMLElement; focus: (key: string) => void } {
   const box = el("div", "chart-card");
@@ -633,7 +823,7 @@ function buildWordTable(
       let diff: number;
       switch (sortKey) {
         case "word": diff = a.word.localeCompare(b.word, "fr"); break;
-        case "lang": diff = a.lang.localeCompare(b.lang); break;
+        case "lang": diff = a.family.localeCompare(b.family); break;
         case "attempts": diff = a.attempts - b.attempts; break;
         case "wpm": diff = (a.wpmAll ?? Infinity) - (b.wpmAll ?? Infinity); break;
         case "okWpm": diff = (a.okWpm ?? Infinity) - (b.okWpm ?? Infinity); break;
@@ -649,7 +839,7 @@ function buildWordTable(
     const headRow = el("tr");
     const allCols: { key: SortKey; label: string; num: boolean; only?: boolean }[] = [
       { key: "word", label: "mot", num: false },
-      { key: "lang", label: "langue", num: false, only: multiLang },
+      { key: "lang", label: "langue", num: false, only: multiFamily },
       { key: "attempts", label: "essais", num: true },
       { key: "wpm", label: "wpm moyen", num: true },
       { key: "okWpm", label: "wpm ✓", num: true },
@@ -677,16 +867,18 @@ function buildWordTable(
       const tr = el("tr");
       if (rrow.key === focusKey) { tr.classList.add("row-focus"); focusTr = tr; }
       const tdWord = el("td");
-      const chip = el("span", "word-chip", rrow.word);
+      const chip = el("span", "word-chip clickable", rrow.word);
       for (const cclass of wordClasses(rrow.stat, { ...cfg, colorBy: "both" })) chip.classList.add(cclass);
+      chip.title = "Voir l'évolution de ce mot";
+      chip.addEventListener("click", () => onWord(rrow.key), { signal });
       tdWord.append(chip);
       const spark = posSparkline(rrow.word, rrow.stat);
       if (spark) tdWord.append(spark);
       tr.append(tdWord);
-      if (multiLang) {
+      if (multiFamily) {
         const tdLang = el("td");
-        const badge = el("span", "lang-badge", LANGS[rrow.lang].label);
-        badge.style.setProperty("--lang-dot", LANG_COLOR[rrow.lang]);
+        const badge = el("span", "lang-badge", FAMILY_LABEL[rrow.family]);
+        badge.style.setProperty("--lang-dot", FAMILY_COLOR[rrow.family]);
         tdLang.append(badge);
         tr.append(tdLang);
       }
@@ -815,6 +1007,7 @@ type BiasWord = {
   index: number;
   wordCount: number;
   pace: boolean;
+  hints: boolean | undefined;
   mode: TestLog["mode"];
   lang: LangId;
   timeMs: number | null;
@@ -847,6 +1040,14 @@ const BIAS_DIMS: Dimension[] = [
     hint: "le curseur de rythme accélère-t-il / ajoute-t-il des fautes ?",
     buckets: ["avec rythme", "sans rythme"],
     of: (w) => (w.pace ? "avec rythme" : "sans rythme"),
+  },
+  {
+    key: "hints",
+    label: "Indices",
+    hint: "les surlignages/soulignages te font-ils taper plus vite / avec moins de fautes ?",
+    buckets: ["avec indices", "sans indices"],
+    of: (w) =>
+      w.hints === undefined ? null : w.hints ? "avec indices" : "sans indices",
   },
   {
     key: "len",
@@ -918,6 +1119,7 @@ function renderBias(root: HTMLElement, logs: TestLog[], showLang: boolean, signa
         index: w.index,
         wordCount: t.wordCount,
         pace: t.pace,
+        hints: t.hints,
         mode: t.mode,
         lang: t.lang,
         timeMs: w.timeMs,
@@ -1039,48 +1241,151 @@ function renderBigrams(root: HTMLElement, bigrams: Record<string, BigramStat>): 
     return;
   }
 
-  const letters = topLetters(bigrams, 15);
+  const DISP = (ch: string) => (ch === " " ? "␣" : ch);
+
+  // --- univers des caractères présents dans les données + poids (fréquence) ---
+  const weight = new Map<string, number>();
+  for (const [key, b] of entries) {
+    const total = b.count + b.errors;
+    if (total === 0) continue;
+    for (const ch of key) weight.set(ch, (weight.get(ch) ?? 0) + total);
+  }
+  const allChars = [...weight.keys()].sort((a, b) => {
+    if (a === " ") return -1;
+    if (b === " ") return 1;
+    return a.localeCompare(b, "fr");
+  });
+  if (allChars.length === 0) {
+    root.append(el("div", "empty-note", "Aucune donnée de bigramme exploitable."));
+    return;
+  }
+
+  // sélection par défaut : l'espace + les caractères les plus fréquents
+  const DEFAULT_MAX = 15;
+  const selected = new Set<string>(
+    [...weight.entries()]
+      .filter(([ch]) => ch !== " ")
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, DEFAULT_MAX)
+      .map(([ch]) => ch)
+  );
+  selected.add(" "); // espace inclus par défaut (chip pour l'enlever)
+
+  // --- sélecteur de caractères (chips interactifs) ---
+  const selBar = el("div", "char-select");
+  selBar.append(el("span", "ctrl-label", "Caractères"));
+  const chipsWrap = el("div", "char-chips");
+  const chipEls = new Map<string, HTMLButtonElement>();
+  for (const ch of allChars) {
+    const chip = el("button", "char-chip" + (selected.has(ch) ? " on" : ""), DISP(ch));
+    chip.title = ch === " " ? "Espace" : ch;
+    chip.addEventListener("click", () => {
+      if (selected.has(ch)) selected.delete(ch);
+      else selected.add(ch);
+      chip.classList.toggle("on", selected.has(ch));
+      build();
+    });
+    chipEls.set(ch, chip);
+    chipsWrap.append(chip);
+  }
+  const setAll = (on: boolean) => {
+    selected.clear();
+    if (on) for (const ch of allChars) selected.add(ch);
+    for (const [ch, chip] of chipEls) chip.classList.toggle("on", selected.has(ch));
+    build();
+  };
+  const actions = el("div", "char-actions");
+  const bAll = el("button", "seg-btn", "Tout");
+  bAll.addEventListener("click", () => setAll(true));
+  const bNone = el("button", "seg-btn", "Aucun");
+  bNone.addEventListener("click", () => setAll(false));
+  actions.append(bAll, bNone);
+  selBar.append(chipsWrap, actions);
+  root.append(selBar);
 
   // --- toggle délai / erreur ---
-  const toggle = el("div", "seg-toggle");
   let metric: "gap" | "error" = "gap";
-  const heatWrap = el("div");
+  const toggle = el("div", "seg-toggle");
   const mkBtn = (key: "gap" | "error", label: string) => {
     const b = el("button", "seg-btn" + (metric === key ? " on" : ""), label);
-    b.addEventListener("click", () => { metric = key; renderHeat(); });
+    b.addEventListener("click", () => {
+      if (metric === key) return;
+      metric = key;
+      for (const btn of toggle.querySelectorAll("button")) btn.classList.remove("on");
+      b.classList.add("on");
+      build();
+    });
     return b;
   };
-  function renderHeat(): void {
-    for (const b of toggle.querySelectorAll("button")) b.classList.remove("on");
-    toggle.querySelector(metric === "gap" ? "button:first-child" : "button:last-child")?.classList.add("on");
-    heatWrap.innerHTML = "";
+  toggle.append(mkBtn("gap", "Délai"), mkBtn("error", "Erreurs"));
+  root.append(toggle);
+
+  // --- conteneur rebâti à chaque changement (métrique ou sélection) ---
+  const dyn = el("div");
+  root.append(dyn);
+
+  function build(): void {
+    dyn.innerHTML = "";
+    const chars = allChars.filter((c) => selected.has(c));
+    if (chars.length === 0) {
+      dyn.append(el("div", "empty-note", "Sélectionne au moins un caractère."));
+      return;
+    }
+
+    // ---------- heatmap (matrice) ----------
     if (metric === "gap") {
-      heatWrap.append(
+      dyn.append(
         heatmap({
           title: "Délai entre frappes (ms)",
-          subtitle: "ligne = 1re lettre · colonne = 2e lettre · plus foncé = plus lent",
-          rows: letters,
-          cols: letters,
+          subtitle: "ligne = 1re lettre · colonne = 2e lettre · or = rapide · rouge = lent · brun = moyen",
+          rows: chars,
+          cols: chars,
           hue: STATUS.serious,
+          color: speedRamp,
+          label: DISP,
           value: (r, c) => {
             const b = bigrams[r + c];
             return b && b.count >= 3 ? bigramAvgGap(b) : null;
           },
           tip: (r, c, v) => {
             const b = bigrams[r + c]!;
-            return `<b class="mono">${r}${c}</b><br><span class="t-dim">${fmt(v)} ms · ${b.count} transitions</span>`;
+            return `<b class="mono">${DISP(r)}${DISP(c)}</b><br><span class="t-dim">${fmt(v)} ms · ${b.count} transitions</span>`;
           },
           legendFormat: (v) => fmt(v) + " ms",
+          rowMargin: (r) => {
+            let g = 0, n = 0;
+            for (const c of chars) { const b = bigrams[r + c]; if (b) { g += b.gapMs; n += b.count; } }
+            const v = n > 0 ? g / n : null;
+            return {
+              v,
+              tip: v === null
+                ? `<b class="mono">${DISP(r)} →</b><br><span class="t-dim">aucune transition mesurée</span>`
+                : `<b class="mono">${DISP(r)} →</b> délai moyen quand « ${DISP(r)} » est la 1re lettre<br><span class="t-dim">${fmt(v)} ms · ${n} transitions</span>`,
+            };
+          },
+          colMargin: (c) => {
+            let g = 0, n = 0;
+            for (const r of chars) { const b = bigrams[r + c]; if (b) { g += b.gapMs; n += b.count; } }
+            const v = n > 0 ? g / n : null;
+            return {
+              v,
+              tip: v === null
+                ? `<b class="mono">→ ${DISP(c)}</b><br><span class="t-dim">aucune transition mesurée</span>`
+                : `<b class="mono">→ ${DISP(c)}</b> délai moyen quand « ${DISP(c)} » est la 2e lettre<br><span class="t-dim">${fmt(v)} ms · ${n} transitions</span>`,
+            };
+          },
+          cornerTip: "Σ — moyenne pondérée des délais sur les caractères affichés (ligne = 1re lettre, colonne = 2e lettre)",
         })
       );
     } else {
-      heatWrap.append(
+      dyn.append(
         heatmap({
           title: "Taux d'erreur par bigramme",
           subtitle: "2e lettre fausse après une 1re correcte",
-          rows: letters,
-          cols: letters,
+          rows: chars,
+          cols: chars,
           hue: STATUS.critical,
+          label: DISP,
           value: (r, c) => {
             const b = bigrams[r + c];
             const total = b ? b.count + b.errors : 0;
@@ -1088,56 +1393,103 @@ function renderBigrams(root: HTMLElement, bigrams: Record<string, BigramStat>): 
           },
           tip: (r, c, v) => {
             const b = bigrams[r + c]!;
-            return `<b class="mono">${r}${c}</b><br><span class="t-dim">${fmtPct(v)} · ${b.errors} erreur(s) / ${b.count + b.errors}</span>`;
+            return `<b class="mono">${DISP(r)}${DISP(c)}</b><br><span class="t-dim">${fmtPct(v)} · ${b.errors} erreur(s) / ${b.count + b.errors}</span>`;
           },
           legendFormat: (v) => fmtPct(v),
+          rowMargin: (r) => {
+            let e = 0, tot = 0;
+            for (const c of chars) { const b = bigrams[r + c]; if (b) { e += b.errors; tot += b.count + b.errors; } }
+            const v = tot > 0 ? e / tot : null;
+            return {
+              v,
+              tip: v === null
+                ? `<b class="mono">${DISP(r)} →</b><br><span class="t-dim">aucune frappe</span>`
+                : `<b class="mono">${DISP(r)} →</b> taux d'erreur quand « ${DISP(r)} » est la 1re lettre<br><span class="t-dim">${fmtPct(v)} · ${e} err. / ${tot}</span>`,
+            };
+          },
+          colMargin: (c) => {
+            let e = 0, tot = 0;
+            for (const r of chars) { const b = bigrams[r + c]; if (b) { e += b.errors; tot += b.count + b.errors; } }
+            const v = tot > 0 ? e / tot : null;
+            return {
+              v,
+              tip: v === null
+                ? `<b class="mono">→ ${DISP(c)}</b><br><span class="t-dim">aucune frappe</span>`
+                : `<b class="mono">→ ${DISP(c)}</b> taux d'erreur quand « ${DISP(c)} » est la 2e lettre<br><span class="t-dim">${fmtPct(v)} · ${e} err. / ${tot}</span>`,
+            };
+          },
+          cornerTip: "Σ — taux d'erreur global sur les caractères affichés (ligne = 1re lettre, colonne = 2e lettre)",
         })
       );
     }
+
+    // ---------- top listes (bigrammes dont les 2 caractères sont sélectionnés, hors espace) ----------
+    const inner = entries.filter(
+      ([k]) => k.length === 2 && k[0] !== " " && selected.has(k[0]!) && selected.has(k[1]!)
+    );
+    const slowest = inner
+      .map(([key, b]) => ({ key, gap: bigramAvgGap(b), count: b.count }))
+      .filter((b) => b.gap !== null && b.count >= 5)
+      .sort((a, b) => (b.gap ?? 0) - (a.gap ?? 0))
+      .slice(0, 12);
+    const faulty = inner
+      .map(([key, b]) => ({ key, errors: b.errors, rate: b.errors / Math.max(1, b.count + b.errors) }))
+      .filter((b) => b.errors >= 2)
+      .sort((a, b) => b.rate - a.rate)
+      .slice(0, 12);
+
+    const cols = el("div", "two-cols");
+    cols.append(
+      barChart({
+        title: "Transitions les plus lentes",
+        items: slowest.map((b) => ({ label: b.key, value: b.gap ?? 0, mono: true, tint: STATUS.serious, sub: `${b.count} fois` })),
+        format: (v) => fmt(v) + " ms",
+      }),
+      barChart({
+        title: "Transitions les plus fautées",
+        items: faulty.map((b) => ({ label: b.key, value: b.rate * 100, mono: true, tint: STATUS.critical, sub: `${b.errors} err.` })),
+        format: (v) => fmt(v, 1) + " %",
+      })
+    );
+    dyn.append(cols);
+
+    // ---------- départs de mot (espace → lettre), seulement si l'espace est sélectionné ----------
+    if (selected.has(" ")) {
+      const spaceEntries = entries.filter(
+        ([k]) => k.length === 2 && k[0] === " " && selected.has(k[1]!)
+      );
+      const startSlow = spaceEntries
+        .map(([k, b]) => ({ letter: k[1] as string, gap: bigramAvgGap(b), count: b.count }))
+        .filter((x) => x.gap !== null && x.count >= 3)
+        .sort((a, b) => (b.gap ?? 0) - (a.gap ?? 0))
+        .slice(0, 12);
+      const startFaulty = spaceEntries
+        .map(([k, b]) => ({ letter: k[1] as string, errors: b.errors, rate: b.errors / Math.max(1, b.count + b.errors) }))
+        .filter((x) => x.errors >= 2)
+        .sort((a, b) => b.rate - a.rate)
+        .slice(0, 12);
+
+      if (startSlow.length > 0 || startFaulty.length > 0) {
+        dyn.append(el("h3", "section-title", "Départs de mot (après une espace)"));
+        const scols = el("div", "two-cols");
+        scols.append(
+          barChart({
+            title: "Lettres les plus lentes à démarrer",
+            items: startSlow.map((x) => ({ label: "␣" + x.letter, value: x.gap ?? 0, mono: true, tint: STATUS.serious, sub: `${x.count} fois` })),
+            format: (v) => fmt(v) + " ms",
+          }),
+          barChart({
+            title: "Lettres les plus fautées à démarrer",
+            items: startFaulty.map((x) => ({ label: "␣" + x.letter, value: x.rate * 100, mono: true, tint: STATUS.critical, sub: `${x.errors} err.` })),
+            format: (v) => fmt(v, 1) + " %",
+          })
+        );
+        dyn.append(scols);
+      }
+    }
   }
-  toggle.append(mkBtn("gap", "Délai"), mkBtn("error", "Erreurs"));
-  root.append(toggle, heatWrap);
-  renderHeat();
 
-  // --- top listes ---
-  const slowest = entries
-    .map(([key, b]) => ({ key, gap: bigramAvgGap(b), count: b.count }))
-    .filter((b) => b.gap !== null && b.count >= 5)
-    .sort((a, b) => (b.gap ?? 0) - (a.gap ?? 0))
-    .slice(0, 12);
-  const faulty = entries
-    .map(([key, b]) => ({ key, errors: b.errors, rate: b.errors / Math.max(1, b.count + b.errors) }))
-    .filter((b) => b.errors >= 2)
-    .sort((a, b) => b.rate - a.rate)
-    .slice(0, 12);
-
-  const cols = el("div", "two-cols");
-  cols.append(
-    barChart({
-      title: "Transitions les plus lentes",
-      items: slowest.map((b) => ({ label: b.key, value: b.gap ?? 0, mono: true, tint: STATUS.serious, sub: `${b.count} fois` })),
-      format: (v) => fmt(v) + " ms",
-    }),
-    barChart({
-      title: "Transitions les plus fautées",
-      items: faulty.map((b) => ({ label: b.key, value: b.rate * 100, mono: true, tint: STATUS.critical, sub: `${b.errors} err.` })),
-      format: (v) => fmt(v, 1) + " %",
-    })
-  );
-  root.append(cols);
-}
-
-function topLetters(bigrams: Record<string, BigramStat>, n: number): string[] {
-  const freq = new Map<string, number>();
-  for (const [key, b] of Object.entries(bigrams)) {
-    const total = b.count + b.errors;
-    for (const ch of key) freq.set(ch, (freq.get(ch) ?? 0) + total);
-  }
-  return [...freq.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, n)
-    .map(([ch]) => ch)
-    .sort((a, b) => a.localeCompare(b, "fr"));
+  build();
 }
 
 // ===========================================================================
@@ -1234,6 +1586,35 @@ function renderActivity(root: HTMLElement, history: HistoryEntry[], viewRoot: HT
   btns.append(exportBtn, importBtn, fileInput, resetBtn);
   dataBox.append(btns);
   root.append(dataBox);
+}
+
+/**
+ * Note comparant moyenne et médiane du WPM. L'écart révèle l'asymétrie : si la
+ * moyenne dépasse la médiane, quelques tests très rapides la tirent vers le haut ;
+ * si elle est en dessous, quelques tests lents ou abandonnés la plombent. La
+ * médiane, elle, reflète mieux ton niveau habituel.
+ */
+function meanMedianNote(mean: number, median: number): HTMLElement {
+  const note = el("div", "empty-note");
+  const gap = mean - median;
+  // seuil : écart négligeable en deçà de ~2 % de la médiane (min 1 wpm)
+  const threshold = Math.max(1, median * 0.02);
+  if (Math.abs(gap) < threshold) {
+    note.textContent =
+      `Moyenne (${fmt(mean)}) et médiane (${fmt(median)}) quasi identiques : ` +
+      "tes tests sont réguliers, la moyenne n'est pas trompeuse.";
+  } else if (gap > 0) {
+    note.textContent =
+      `Moyenne ${fmt(mean)} > médiane ${fmt(median)} (+${fmt(gap)} wpm) : ` +
+      "quelques tests très rapides tirent la moyenne vers le haut. " +
+      "La médiane reflète mieux ton niveau habituel.";
+  } else {
+    note.textContent =
+      `Moyenne ${fmt(mean)} < médiane ${fmt(median)} (${fmt(gap)} wpm) : ` +
+      "quelques tests lents (ou abandonnés) plombent la moyenne. " +
+      "La médiane reflète mieux ton niveau habituel.";
+  }
+  return note;
 }
 
 // ---- utilitaires ----------------------------------------------------------

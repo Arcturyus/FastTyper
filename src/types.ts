@@ -63,6 +63,7 @@ export type TestLog = {
   mode: TestMode;
   pace: boolean; // curseur de rythme réellement actif pendant le test
   paceWpm: number | null; // vitesse cible du rythme, si actif
+  hints?: boolean; // surlignages/soulignages affichés pendant le test (optionnel : absent des anciens journaux)
   wordCount: number; // longueur voulue du test (10/25/50)
   completed: boolean; // true = test terminé, false = abandonné en cours
   words: WordAttempt[]; // uniquement les mots atteints
@@ -101,6 +102,7 @@ export type Config = {
   lang: LangId;
   wordCount: number;
   colorBy: "off" | "speed" | "errors" | "both";
+  hints: boolean; // interrupteur global des indices (surlignages/soulignages)
   minAttempts: number; // essais requis avant de colorer un mot
   slowWpm: number; // en dessous ou égal → mot "lent"
   fastWpm: number; // au-dessus ou égal → mot "rapide"

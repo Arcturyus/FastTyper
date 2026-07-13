@@ -3,16 +3,20 @@ import type {
   HistoryEntry,
   LangId,
   TestLog,
+  TestMode,
   TestResult,
   WordStat,
 } from "./types";
+import { ALL_FAMILIES, FAMILY_OF, type LangFamily } from "./lang";
 
-const wordsKey = (lang: LangId) => `ft:words:${lang}`;
-const bigramsKey = (lang: LangId) => `ft:bigrams:${lang}`;
-const testLogKey = (lang: LangId) => `ft:testlog:${lang}`;
+// les clés de stockage sont partagées par famille (fr/fr1k → "fr", en/en1k → "en") :
+// un mot pratiqué dans un pool profite immédiatement à l'autre taille de pool.
+const wordsKey = (lang: LangId) => `ft:words:${FAMILY_OF[lang]}`;
+const bigramsKey = (lang: LangId) => `ft:bigrams:${FAMILY_OF[lang]}`;
+const testLogKey = (lang: LangId) => `ft:testlog:${FAMILY_OF[lang]}`;
 const HISTORY_KEY = "ft:history";
 const HISTORY_MAX = 500;
-const TESTLOG_MAX = 1500; // tests bruts conservés par langue (terminés + abandonnés)
+const TESTLOG_MAX = 1500; // tests bruts conservés par famille (terminés + abandonnés)
 
 function read<T>(key: string, fallback: T): T {
   try {
@@ -22,6 +26,94 @@ function read<T>(key: string, fallback: T): T {
     return fallback;
   }
 }
+
+// ---------------------------------------------------------------------------
+//  Migration ponctuelle : avant la fusion par famille, les données étaient
+//  cloisonnées par variante de pool (fr/fr1k/en/en1k). On replie la variante
+//  « secondaire » (fr1k, en1k) dans le panier de la famille (dont la clé
+//  coïncide avec la variante « primaire », fr/en) puis on supprime l'ancienne
+//  clé. Exécuté une seule fois au chargement du module.
+// ---------------------------------------------------------------------------
+const STORAGE_VERSION_KEY = "ft:storageVersion";
+const SECONDARY_VARIANT: Record<LangFamily, LangId> = { fr: "fr1k", en: "en1k" };
+
+function mergeWordStat(a: WordStat, b: WordStat): WordStat {
+  const len = Math.max(a.posErrors?.length ?? 0, b.posErrors?.length ?? 0);
+  const posErrors: number[] = [];
+  for (let p = 0; p < len; p++) posErrors[p] = (a.posErrors?.[p] ?? 0) + (b.posErrors?.[p] ?? 0);
+  return {
+    attempts: a.attempts + b.attempts,
+    errors: a.errors + b.errors,
+    errorAttempts: a.errorAttempts + b.errorAttempts,
+    posErrors,
+    timeMs: a.timeMs + b.timeMs,
+    timedChars: a.timedChars + b.timedChars,
+    timedAttempts: a.timedAttempts + b.timedAttempts,
+    last: Math.max(a.last, b.last),
+  };
+}
+
+function mergeWordStatsRecords(
+  a: Record<string, WordStat>,
+  b: Record<string, WordStat>
+): Record<string, WordStat> {
+  const out: Record<string, WordStat> = { ...a };
+  for (const [word, s] of Object.entries(b)) {
+    out[word] = out[word] ? mergeWordStat(out[word]!, s) : s;
+  }
+  return out;
+}
+
+function mergeBigramStat(a: BigramStat, b: BigramStat): BigramStat {
+  return { count: a.count + b.count, gapMs: a.gapMs + b.gapMs, errors: a.errors + b.errors };
+}
+
+function mergeBigramStatsRecords(
+  a: Record<string, BigramStat>,
+  b: Record<string, BigramStat>
+): Record<string, BigramStat> {
+  const out: Record<string, BigramStat> = { ...a };
+  for (const [key, s] of Object.entries(b)) {
+    out[key] = out[key] ? mergeBigramStat(out[key]!, s) : s;
+  }
+  return out;
+}
+
+function mergeLegacyBucket<T>(
+  legacyKey: string,
+  targetKey: string,
+  merge: (a: T, b: T) => T,
+  empty: T
+): void {
+  const raw = localStorage.getItem(legacyKey);
+  if (!raw) return;
+  try {
+    const legacy = JSON.parse(raw) as T;
+    const current = read(targetKey, empty);
+    localStorage.setItem(targetKey, JSON.stringify(merge(current, legacy)));
+  } catch {
+    // données corrompues : on abandonne la fusion mais on nettoie quand même la clé
+  }
+  localStorage.removeItem(legacyKey);
+}
+
+function migrateToFamilyStorage(): void {
+  if (localStorage.getItem(STORAGE_VERSION_KEY) === "2") return;
+  for (const family of ALL_FAMILIES) {
+    const secondary = SECONDARY_VARIANT[family];
+    mergeLegacyBucket(`ft:words:${secondary}`, wordsKey(family), mergeWordStatsRecords, {});
+    mergeLegacyBucket(`ft:bigrams:${secondary}`, bigramsKey(family), mergeBigramStatsRecords, {});
+    mergeLegacyBucket<TestLog[]>(
+      `ft:testlog:${secondary}`,
+      testLogKey(family),
+      (a, b) => [...a, ...b].sort((x, y) => x.date - y.date).slice(-TESTLOG_MAX),
+      []
+    );
+  }
+  localStorage.setItem(STORAGE_VERSION_KEY, "2");
+}
+
+migrateToFamilyStorage();
 
 export function loadWordStats(lang: LangId): Record<string, WordStat> {
   return read(wordsKey(lang), {});
@@ -50,6 +142,14 @@ export function appendTestLog(entry: TestLog): void {
   );
 }
 
+/** Médiane d'une liste (copie triée), ou null si vide. */
+export function median(xs: number[]): number | null {
+  if (xs.length === 0) return null;
+  const s = [...xs].sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 ? (s[m] as number) : ((s[m - 1] as number) + (s[m] as number)) / 2;
+}
+
 /** WPM moyen sur les n derniers tests de cette langue, ou null si aucun */
 export function recentAvgWpm(lang: LangId, n: number): number | null {
   const entries = loadHistory()
@@ -59,60 +159,65 @@ export function recentAvgWpm(lang: LangId, n: number): number | null {
   return entries.reduce((sum, h) => sum + h.wpm, 0) / entries.length;
 }
 
+/**
+ * Cible du curseur de rythme : WPM MÉDIAN sur les n derniers tests de cette
+ * langue ET de ce mode. La médiane résiste aux tests aberrants (une hésitation
+ * ou un abandon ne fausse pas la cible). En entraînement, on ne compare qu'aux
+ * entraînements ; en normal, qu'aux tests normaux.
+ */
+export function paceTargetWpm(lang: LangId, n: number, mode: TestMode): number | null {
+  const wpms = loadHistory()
+    .filter((h) => h.lang === lang && h.mode === mode)
+    .slice(-Math.max(1, n))
+    .map((h) => h.wpm);
+  return median(wpms);
+}
+
 /** WPM moyen d'un mot, ou null si aucun essai chronométré */
 export function wordAvgWpm(s: WordStat): number | null {
   if (s.timedAttempts === 0 || s.timeMs <= 0) return null;
   return (s.timedChars / 5) / (s.timeMs / 60000);
 }
 
-/** Un mot avec sa langue d'origine (l'identité de langue est conservée). */
-export type TaggedWord = { lang: LangId; word: string; stat: WordStat };
+/** Un mot avec sa famille de langue d'origine (fr/fr1k et en/en1k sont fusionnés). */
+export type TaggedWord = { family: LangFamily; word: string; stat: WordStat };
 
-/**
- * Charge les stats de mots de plusieurs langues en conservant l'identité de
- * langue par mot (« police », « important »… existent dans plusieurs langues,
- * on ne les fusionne donc pas).
- */
-export function loadWordStatsTagged(langs: LangId[]): TaggedWord[] {
+/** Charge les stats de mots de plusieurs familles de langue (une par famille, sans doublon). */
+export function loadWordStatsTagged(families: LangFamily[]): TaggedWord[] {
   const out: TaggedWord[] = [];
-  for (const lang of langs) {
-    const stats = loadWordStats(lang);
+  for (const family of families) {
+    const stats = loadWordStats(family);
     for (const [word, stat] of Object.entries(stats)) {
-      out.push({ lang, word, stat });
+      out.push({ family, word, stat });
     }
   }
   return out;
 }
 
-/** Fusionne les stats de bigrammes de plusieurs langues (clé = transition). */
-export function loadBigramStatsMerged(langs: LangId[]): Record<string, BigramStat> {
-  const merged: Record<string, BigramStat> = {};
-  for (const lang of langs) {
-    for (const [key, b] of Object.entries(loadBigramStats(lang))) {
-      const cur = merged[key] ?? { count: 0, gapMs: 0, errors: 0 };
-      cur.count += b.count;
-      cur.gapMs += b.gapMs;
-      cur.errors += b.errors;
-      merged[key] = cur;
-    }
+/** Fusionne les stats de bigrammes de plusieurs familles de langue (clé = transition). */
+export function loadBigramStatsMerged(families: LangFamily[]): Record<string, BigramStat> {
+  let merged: Record<string, BigramStat> = {};
+  for (const family of families) {
+    merged = mergeBigramStatsRecords(merged, loadBigramStats(family));
   }
   return merged;
 }
 
-/** Concatène les journaux bruts de plusieurs langues. */
-export function loadTestLogMulti(langs: LangId[]): TestLog[] {
+/** Concatène les journaux bruts de plusieurs familles de langue. */
+export function loadTestLogMulti(families: LangFamily[]): TestLog[] {
   const out: TestLog[] = [];
-  for (const lang of langs) out.push(...loadTestLog(lang));
+  for (const family of families) out.push(...loadTestLog(family));
   return out;
 }
 
 /**
  * Vitesse d'un mot ventilée selon l'issue de l'essai : réussi (tapé juste) vs
  * fauté (tapé en entier mais avec au moins une erreur). Reconstruit depuis le
- * journal brut, donc rétroactif sur les données existantes.
+ * journal brut, donc rétroactif sur les données existantes. Fusionné par
+ * famille de langue (fr/fr1k, en/en1k).
  */
 export type OutcomeSpeed = {
-  lang: LangId;
+  family: LangFamily;
   word: string;
   okChars: number;
   okMs: number;
@@ -122,18 +227,19 @@ export type OutcomeSpeed = {
   badN: number; // essais fautés mais complets, chronométrés
 };
 
-const outcomeKey = (lang: LangId, word: string) => `${lang} ${word}`;
+const outcomeKey = (family: LangFamily, word: string) => `${family} ${word}`;
 
-/** Agrège, par (langue, mot), la vitesse en réussite vs en échec. */
+/** Agrège, par (famille, mot), la vitesse en réussite vs en échec. */
 export function wordOutcomeSpeeds(logs: TestLog[]): Map<string, OutcomeSpeed> {
   const map = new Map<string, OutcomeSpeed>();
   for (const t of logs) {
+    const family = FAMILY_OF[t.lang];
     for (const w of t.words) {
       if (w.timeMs === null || w.timeMs <= 0) continue; // uniquement les mots chronométrés
-      const key = outcomeKey(t.lang, w.text);
+      const key = outcomeKey(family, w.text);
       let o = map.get(key);
       if (!o) {
-        o = { lang: t.lang, word: w.text, okChars: 0, okMs: 0, okN: 0, badChars: 0, badMs: 0, badN: 0 };
+        o = { family, word: w.text, okChars: 0, okMs: 0, okN: 0, badChars: 0, badMs: 0, badN: 0 };
         map.set(key, o);
       }
       if (w.correct) {
@@ -158,6 +264,80 @@ export function okWpm(o: OutcomeSpeed): number | null {
 /** WPM sur les essais fautés (mais complets), ou null si aucun. */
 export function badWpm(o: OutcomeSpeed): number | null {
   return o.badN > 0 && o.badMs > 0 ? o.badChars / 5 / (o.badMs / 60000) : null;
+}
+
+/**
+ * Vitesse « hors erreur » (WPM sur essais réussis) par mot pour une langue,
+ * reconstruite depuis le journal brut. Sert au surlignage : la couleur reflète
+ * la vitesse pure du mot, l'erreur étant déjà signalée par le soulignage.
+ */
+export function okWpmByWord(lang: LangId): Map<string, number> {
+  const map = new Map<string, number>();
+  for (const o of wordOutcomeSpeeds(loadTestLog(lang)).values()) {
+    const w = okWpm(o);
+    if (w !== null) map.set(o.word, w);
+  }
+  return map;
+}
+
+/**
+ * Vitesse MÉDIANE hors erreur par mot, reconstruite depuis le journal brut.
+ * Contrairement à {@link okWpmByWord} (qui est un rapport de sommes, donc une
+ * moyenne pondérée), on garde ici chaque essai réussi comme un échantillon et on
+ * en prend la médiane : un mot ponctuellement tapé très lentement (hésitation)
+ * ne teinte plus tout le mot en « lent ».
+ */
+export function okWpmMedianByWord(lang: LangId): Map<string, number> {
+  const samples = new Map<string, number[]>();
+  for (const t of loadTestLog(lang)) {
+    for (const w of t.words) {
+      if (w.timeMs === null || w.timeMs <= 0 || !w.correct) continue;
+      const wpm = w.len / 5 / (w.timeMs / 60000);
+      let arr = samples.get(w.text);
+      if (!arr) samples.set(w.text, (arr = []));
+      arr.push(wpm);
+    }
+  }
+  const map = new Map<string, number>();
+  for (const [word, arr] of samples) {
+    const m = median(arr);
+    if (m !== null) map.set(word, m);
+  }
+  return map;
+}
+
+/** Un essai daté d'un mot précis, reconstruit depuis le journal brut. */
+export type WordTrial = {
+  date: number;
+  mode: TestMode;
+  wpm: number | null; // null si le mot n'a pas été tapé en entier (non chronométré)
+  errors: number; // frappes fausses commises sur cet essai
+  faulted: boolean; // au moins une faute
+};
+
+/**
+ * Reconstruit la chronologie des essais d'un mot précis (famille + texte) depuis
+ * le journal brut, du plus ancien au plus récent. Sert à visualiser l'évolution
+ * de la vitesse et des fautes sur ce mot, notamment au fil des entraînements.
+ * Agrège les deux tailles de pool d'une même famille (fr/fr1k, en/en1k).
+ */
+export function wordTrials(logs: TestLog[], family: LangFamily, word: string): WordTrial[] {
+  const out: WordTrial[] = [];
+  for (const t of logs) {
+    if (FAMILY_OF[t.lang] !== family) continue;
+    for (const w of t.words) {
+      if (w.text !== word) continue;
+      out.push({
+        date: t.date,
+        mode: t.mode,
+        wpm: w.timeMs !== null && w.timeMs > 0 ? w.len / 5 / (w.timeMs / 60000) : null,
+        errors: w.errors,
+        faulted: w.errors > 0,
+      });
+    }
+  }
+  out.sort((a, b) => a.date - b.date);
+  return out;
 }
 
 /** Part des essais comportant au moins une erreur (0..1) */
@@ -248,21 +428,22 @@ export const ALL_LANGS: LangId[] = ["fr", "fr1k", "en", "en1k"];
 
 export function exportData(): string {
   const data: Record<string, unknown> = {
-    version: 1,
+    version: 2,
     config: read("ft:config", null),
     history: loadHistory(),
   };
-  for (const lang of ALL_LANGS) {
-    data[`words:${lang}`] = loadWordStats(lang);
-    data[`bigrams:${lang}`] = loadBigramStats(lang);
-    data[`testlog:${lang}`] = loadTestLog(lang);
+  for (const family of ALL_FAMILIES) {
+    data[`words:${family}`] = loadWordStats(family);
+    data[`bigrams:${family}`] = loadBigramStats(family);
+    data[`testlog:${family}`] = loadTestLog(family);
   }
   return JSON.stringify(data, null, 2);
 }
 
 export function importData(json: string): void {
   const data = JSON.parse(json) as Record<string, unknown>;
-  if (typeof data !== "object" || data === null || data["version"] !== 1) {
+  const version = data["version"];
+  if (typeof data !== "object" || data === null || (version !== 1 && version !== 2)) {
     throw new Error("Format de fichier non reconnu");
   }
   if (data["config"]) {
@@ -271,29 +452,52 @@ export function importData(json: string): void {
   if (Array.isArray(data["history"])) {
     localStorage.setItem(HISTORY_KEY, JSON.stringify(data["history"]));
   }
-  for (const lang of ALL_LANGS) {
-    if (data[`words:${lang}`]) {
-      localStorage.setItem(wordsKey(lang), JSON.stringify(data[`words:${lang}`]));
+
+  if (version === 2) {
+    for (const family of ALL_FAMILIES) {
+      if (data[`words:${family}`]) {
+        localStorage.setItem(wordsKey(family), JSON.stringify(data[`words:${family}`]));
+      }
+      if (data[`bigrams:${family}`]) {
+        localStorage.setItem(bigramsKey(family), JSON.stringify(data[`bigrams:${family}`]));
+      }
+      if (data[`testlog:${family}`]) {
+        localStorage.setItem(testLogKey(family), JSON.stringify(data[`testlog:${family}`]));
+      }
     }
-    if (data[`bigrams:${lang}`]) {
+    return;
+  }
+
+  // version 1 (héritage) : sections par variante (fr/fr1k/en/en1k), à fusionner par famille
+  for (const lang of ALL_LANGS) {
+    const words = data[`words:${lang}`] as Record<string, WordStat> | undefined;
+    if (words) {
+      localStorage.setItem(
+        wordsKey(lang),
+        JSON.stringify(mergeWordStatsRecords(read(wordsKey(lang), {}), words))
+      );
+    }
+    const bg = data[`bigrams:${lang}`] as Record<string, BigramStat> | undefined;
+    if (bg) {
       localStorage.setItem(
         bigramsKey(lang),
-        JSON.stringify(data[`bigrams:${lang}`])
+        JSON.stringify(mergeBigramStatsRecords(read(bigramsKey(lang), {}), bg))
       );
     }
-    if (data[`testlog:${lang}`]) {
-      localStorage.setItem(
-        testLogKey(lang),
-        JSON.stringify(data[`testlog:${lang}`])
-      );
+    const logs = data[`testlog:${lang}`] as TestLog[] | undefined;
+    if (logs) {
+      const merged = [...read<TestLog[]>(testLogKey(lang), []), ...logs]
+        .sort((a, b) => a.date - b.date)
+        .slice(-TESTLOG_MAX);
+      localStorage.setItem(testLogKey(lang), JSON.stringify(merged));
     }
   }
 }
 
 export function resetData(): void {
   const keys: string[] = [HISTORY_KEY];
-  for (const lang of ALL_LANGS) {
-    keys.push(wordsKey(lang), bigramsKey(lang), testLogKey(lang));
+  for (const family of ALL_FAMILIES) {
+    keys.push(wordsKey(family), bigramsKey(family), testLogKey(family));
   }
   for (const k of keys) localStorage.removeItem(k);
 }

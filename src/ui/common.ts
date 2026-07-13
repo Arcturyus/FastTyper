@@ -34,6 +34,41 @@ export function wordClasses(
   return classes;
 }
 
+/**
+ * Rang (0..1) d'une vitesse dans la distribution triée (croissante) des vitesses
+ * de tes mots : le mot le plus lent → 0, le plus rapide → 1. L'échelle s'adapte
+ * ainsi à TA répartition, indépendamment des seuils de réglage.
+ */
+export function speedPercentile(wpm: number, sortedAsc: number[]): number {
+  const n = sortedAsc.length;
+  if (n <= 1) return 0.5;
+  let lo = 0;
+  let hi = n;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((sortedAsc[mid] as number) <= wpm) lo = mid + 1;
+    else hi = mid;
+  }
+  return Math.max(0, Math.min(1, (lo - 1) / (n - 1))); // rang du mot lui-même
+}
+
+/**
+ * Teinte d'encre d'un mot d'après son rang de vitesse (`pct`, 0..1). Le corps de
+ * l'échelle reste bronze mat (`spd` : bronze foncé lent → bronze cuivré rapide) ;
+ * seuls les deux extrêmes s'allument, de façon symétrique et lumineuse :
+ * `gold` vire à l'or sur le top 1 % (l'élite) et `redMix` vire au rouge orangé
+ * sanguin sur les ~30 % les plus lents, en montant très fort vers les tout plus
+ * lents — aussi flagrant que l'or.
+ */
+export function speedShade(
+  pct: number
+): { spd: number; redMix: number; gold: number } {
+  const red = Math.max(0, Math.min(1, (0.3 - pct) / 0.3)); // 30% les plus lents
+  const redMix = Math.pow(red, 1.6); // monte très fort vers les tout plus lents
+  const gold = Math.max(0, Math.min(1, (pct - 0.99) / 0.01)); // or : top 1% seulement
+  return { spd: pct, redMix, gold };
+}
+
 export function fmt(n: number, digits = 0): string {
   return n.toLocaleString("fr-FR", {
     minimumFractionDigits: digits,

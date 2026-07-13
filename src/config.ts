@@ -6,6 +6,7 @@ export const DEFAULT_CONFIG: Config = {
   lang: "fr",
   wordCount: 25,
   colorBy: "both",
+  hints: true,
   minAttempts: 3,
   slowWpm: 35,
   fastWpm: 65,
@@ -14,7 +15,7 @@ export const DEFAULT_CONFIG: Config = {
   practiceErrRate: 0.2,
   practiceMaxWpm: 40,
   practicePoolSize: 30,
-  paceCaret: false,
+  paceCaret: true,
   paceAvgCount: 10,
 };
 

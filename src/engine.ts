@@ -99,9 +99,16 @@ export class TestEngine {
     correct: boolean,
     now: number
   ): void {
-    if (pos === 0) return;
-    if (word.states[pos - 1] !== "correct") return;
-    const key = (word.text[pos - 1] as string) + (word.text[pos] as string);
+    let key: string;
+    if (pos === 0) {
+      // transition espace → première lettre du mot (départ de mot) ; on ignore
+      // le tout premier mot du test, qui n'est précédé d'aucune espace
+      if (this.index === 0) return;
+      key = " " + (word.text[0] as string);
+    } else {
+      if (word.states[pos - 1] !== "correct") return;
+      key = (word.text[pos - 1] as string) + (word.text[pos] as string);
+    }
     const b = this.bigrams.get(key) ?? { count: 0, gapMs: 0, errors: 0 };
     if (correct) {
       if (this.lastKeyMs !== null) {
@@ -125,7 +132,23 @@ export class TestEngine {
     word.endMs = now;
     const correct = word.typed === word.text;
     this.keystrokes.push({ t: now - this.startedAt, correct });
-    this.lastKeyMs = null;
+    // fin de mot : bigramme « dernière lettre → espace ». On ne le mesure que si
+    // la dernière frappe était correcte (lastKeyMs pointe alors sur cette lettre).
+    if (this.lastKeyMs !== null) {
+      const pos = word.typed.length - 1;
+      const ch = word.text[pos] as string;
+      const key = ch + " ";
+      const b = this.bigrams.get(key) ?? { count: 0, gapMs: 0, errors: 0 };
+      const gap = now - this.lastKeyMs;
+      if (gap > 0 && gap <= BIGRAM_MAX_GAP) {
+        b.count += 1;
+        b.gapMs += gap;
+      }
+      this.bigrams.set(key, b);
+    }
+    // on garde l'instant de l'espace comme référence pour chronométrer la
+    // première frappe du mot suivant (bigramme « espace → lettre »)
+    this.lastKeyMs = now;
     this.index += 1;
     if (this.index >= this.words.length) {
       this.finishedAt = now;
