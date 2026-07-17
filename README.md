@@ -6,7 +6,7 @@ Petit site perso de vitesse de frappe, inspiré de [Monkeytype](https://github.c
 
 ```bash
 npm install
-npm run dev      # http://localhost:5173
+npm run dev      # http://localhost:5177
 npm run build    # production dans dist/
 ```
 
