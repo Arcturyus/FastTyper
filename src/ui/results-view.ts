@@ -7,6 +7,11 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 type ResultHandlers = {
   onRestart: () => void;
   onPracticeWords: (words: string[]) => void;
+  onDelete: () => void;
+};
+
+type ResultInfo = {
+  newRecord: boolean;
 };
 
 function wordWpm(w: WordResult): number | null {
@@ -17,14 +22,21 @@ function wordWpm(w: WordResult): number | null {
 export function renderResults(
   root: HTMLElement,
   result: TestResult,
-  handlers: ResultHandlers
+  handlers: ResultHandlers,
+  info: ResultInfo = { newRecord: false }
 ): void {
   root.innerHTML = "";
+
+  // --- bannière nouveau record ---
+  if (info.newRecord) {
+    root.append(el("div", "record-banner gold-metal", "🏆 Nouveau record !"));
+  }
 
   // --- tuiles ---
   const tiles = el("div", "result-tiles");
   const mk = (label: string, value: string, unit: string, hero = false) => {
     const tile = el("div", hero ? "tile hero" : "tile");
+    if (hero && info.newRecord) tile.classList.add("record");
     tile.append(el("div", "label", label));
     const v = el("div", hero ? "value gold-metal" : "value", value);
     if (unit) v.append(el("span", "unit", unit));
@@ -118,6 +130,23 @@ export function renderResults(
     );
     btns.append(practice);
   }
+  // suppression du test : le retire entièrement des stats (mots, bigrammes,
+  // historique, record, journal). Demande confirmation car c'est définitif.
+  const del = el("button", "btn danger", "🗑 Supprimer ce test");
+  del.title = "Retire ce test de toutes tes statistiques (définitif)";
+  del.addEventListener("click", () => {
+    if (del.classList.contains("confirm")) {
+      handlers.onDelete();
+      return;
+    }
+    del.classList.add("confirm");
+    del.textContent = "Confirmer la suppression ?";
+    window.setTimeout(() => {
+      del.classList.remove("confirm");
+      del.textContent = "🗑 Supprimer ce test";
+    }, 3000);
+  });
+  btns.append(del);
   root.append(btns);
 }
 
@@ -197,6 +226,24 @@ function buildChart(result: TestResult): HTMLElement {
   path.setAttribute("stroke-width", "2");
   path.setAttribute("stroke-linejoin", "round");
   svg.append(path);
+
+  // marqueurs de fautes : petit point rouge sur la courbe à l'instant de chaque
+  // frappe fausse, pour voir si les erreurs cassent le rythme
+  for (const et of result.errorTimes) {
+    if (et < 0 || et > maxT) continue;
+    let near = series[0];
+    if (!near) break;
+    for (const p of series) {
+      if (Math.abs(p.t - et) < Math.abs(near.t - et)) near = p;
+    }
+    const dotErr = document.createElementNS(SVG_NS, "circle");
+    dotErr.setAttribute("cx", String(x(et)));
+    dotErr.setAttribute("cy", String(y(near.wpm)));
+    dotErr.setAttribute("r", "2.5");
+    dotErr.setAttribute("fill", "#c9482f");
+    dotErr.setAttribute("opacity", "0.75");
+    svg.append(dotErr);
+  }
 
   // --- survol : crosshair + tooltip ---
   const crosshair = addLine(0, M.top, 0, M.top + ih, "#8a7d5c");

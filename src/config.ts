@@ -1,10 +1,17 @@
 import type { Config } from "./types";
+import { storage } from "./db";
 
 const KEY = "ft:config";
 
 export const DEFAULT_CONFIG: Config = {
   lang: "fr",
   wordCount: 25,
+  testKind: "words",
+  duration: 30,
+  punctuation: false,
+  sudden: false,
+  smoothCaret: true,
+  paceTarget: "median",
   colorBy: "both",
   hints: true,
   minAttempts: 3,
@@ -21,7 +28,7 @@ export const DEFAULT_CONFIG: Config = {
 
 export function loadConfig(): Config {
   try {
-    const raw = localStorage.getItem(KEY);
+    const raw = storage.getItem(KEY);
     if (!raw) return { ...DEFAULT_CONFIG };
     return { ...DEFAULT_CONFIG, ...(JSON.parse(raw) as Partial<Config>) };
   } catch {
@@ -30,5 +37,5 @@ export function loadConfig(): Config {
 }
 
 export function saveConfig(cfg: Config): void {
-  localStorage.setItem(KEY, JSON.stringify(cfg));
+  storage.setItem(KEY, JSON.stringify(cfg));
 }

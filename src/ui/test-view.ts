@@ -1,16 +1,29 @@
-import { TestEngine } from "../engine";
+import { IDLE_ABANDON_MS, TestEngine } from "../engine";
+import type { WordInput } from "../engine";
 import { loadConfig, saveConfig } from "../config";
 import {
   appendTestLog,
   applyResult,
+  bestRecord,
+  loadBigramStats,
   loadWordStats,
   okWpmMedianByWord,
   paceTargetWpm,
+  removeTestLog,
+  revertResult,
+  saveRecord,
   wordAvgWpm,
   wordErrRate,
   wordPosErrorRates,
 } from "../store";
-import { generatePractice, generateWords, LANGS } from "../wordlist";
+import {
+  decoratePunctuation,
+  generateBigramPractice,
+  generatePractice,
+  generateWordDrill,
+  generateWords,
+  LANGS,
+} from "../wordlist";
 import type { Config, LangId, TestMode, TestWord, WordStat } from "../types";
 
 // intensité minimale d'un trait de soulignage coloré (pour rester visible)
@@ -20,9 +33,16 @@ import { renderResults } from "./results-view";
 
 const WORD_COUNTS = [10, 25, 50];
 
+const WORD_DURATIONS = [15, 30, 60];
+
 export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
   let cfg = loadConfig();
   let mode: TestMode = "normal";
+  // type d'entraînement quand mode === "practice" : mots lents/fautés ou bigrammes
+  let practiceKind: "words" | "bigrams" = "words";
+  // mot à réviser en boucle (entraînement lancé depuis l'onglet Stats)
+  let drillWord: string | null = null;
+  let timeTimer: number | undefined; // fin automatique du mode durée
   let engine: TestEngine;
   let stats: Record<string, WordStat> = {};
   let okSpeeds = new Map<string, number>(); // vitesse hors erreur par mot
@@ -32,6 +52,13 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
   let paceRaf = 0;
   let paceWpm: number | null = null; // vitesse cible (moyenne des n derniers)
   let logged = false; // le test courant a-t-il déjà été écrit au journal ?
+  // --- mesures fines par test (dwell time & rollover), agrégées ici ---
+  let dwellSum = 0;
+  let dwellN = 0;
+  let rollCount = 0;
+  let keyDownN = 0;
+  let keysHeld = 0;
+  const keyDownAt = new Map<string, number>();
   /** mots imposés pour un entraînement lancé depuis l'écran de résultats */
   let forcedPool: string[] | null = null;
 
@@ -43,10 +70,12 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
   const wordsEl = el("div", "words");
   const paceCaret = el("div", "pace-caret");
   paceCaret.hidden = true;
+  const liveCaret = el("div", "live-caret"); // curseur lisse (option)
+  liveCaret.hidden = true;
   const focusHint = el("div", "focus-hint", "Clique ici puis tape pour commencer");
   focusHint.hidden = true;
-  // le curseur de rythme est enfant de wordsWrap (survit au re-render de wordsEl)
-  wordsWrap.append(wordsEl, paceCaret, focusHint);
+  // les curseurs sont enfants de wordsWrap (survivent au re-render de wordsEl)
+  wordsWrap.append(wordsEl, paceCaret, liveCaret, focusHint);
   const footer = el("div", "test-footer");
   const speedLegend = el("div", "speed-legend");
   speedLegend.hidden = true;
@@ -93,11 +122,26 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
 
   function renderControls(): void {
     controls.innerHTML = "";
+    // chips « nombre de mots » (mode mots)
     for (const count of WORD_COUNTS) {
       const b = el("button", "chip-btn", String(count));
-      if (cfg.wordCount === count) b.classList.add("on");
+      if (cfg.testKind === "words" && cfg.wordCount === count) b.classList.add("on");
       b.addEventListener("click", () => {
+        cfg.testKind = "words";
         cfg.wordCount = count;
+        saveConfig(cfg);
+        newTest();
+      });
+      controls.append(b);
+    }
+    // chips « durée » (mode chrono)
+    for (const secs of WORD_DURATIONS) {
+      const b = el("button", "chip-btn", secs + "s");
+      if (cfg.testKind === "time" && cfg.duration === secs) b.classList.add("on");
+      b.title = "Test au chrono : tape le plus possible en " + secs + " s";
+      b.addEventListener("click", () => {
+        cfg.testKind = "time";
+        cfg.duration = secs;
         saveConfig(cfg);
         newTest();
       });
@@ -119,14 +163,53 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     });
     controls.append(langSel);
 
+    // ponctuation & majuscules (sans effet sur le pool code ni en entraînement)
+    const punctBtn = el("button", "chip-btn", "Aa,");
+    if (cfg.punctuation) punctBtn.classList.add("on");
+    punctBtn.title =
+      "Saupoudre majuscules et ponctuation pour se rapprocher d'un texte réel";
+    punctBtn.addEventListener("click", () => {
+      cfg.punctuation = !cfg.punctuation;
+      saveConfig(cfg);
+      newTest();
+    });
+    controls.append(punctBtn);
+
+    // mort subite : une faute arrête le test
+    const suddenBtn = el("button", "chip-btn", "☠");
+    if (cfg.sudden) suddenBtn.classList.add("on");
+    suddenBtn.title = "Mort subite : la moindre faute arrête le test";
+    suddenBtn.addEventListener("click", () => {
+      cfg.sudden = !cfg.sudden;
+      saveConfig(cfg);
+      newTest();
+    });
+    controls.append(suddenBtn);
+
     controls.append(el("span", "sep", "|"));
-    const practiceBtn = el("button", "chip-btn", "⚑ Entraînement");
+    // entraînement : cycle normal → ⚑ mots lents/fautés → ⚑ bigrammes difficiles
+    const practiceLabel =
+      mode !== "practice"
+        ? "⚑ Entraînement"
+        : practiceKind === "bigrams"
+        ? "⚑ Bigrammes"
+        : "⚑ Mots";
+    const practiceBtn = el("button", "chip-btn", practiceLabel);
     if (mode === "practice") practiceBtn.classList.add("practice-on");
     practiceBtn.title =
-      "Test ciblé sur tes mots lents ou fautés (seuils dans Réglages)";
+      "Cycle : off → mots lents/fautés → bigrammes difficiles (seuils dans Réglages)";
     practiceBtn.addEventListener("click", () => {
-      mode = mode === "practice" ? "normal" : "practice";
+      drillWord = null;
       forcedPool = null;
+      if (mode !== "practice") {
+        mode = "practice";
+        practiceKind = "words";
+      } else if (practiceKind === "words") {
+        practiceKind = "bigrams";
+      } else {
+        mode = "normal";
+        practiceKind = "words";
+      }
       newTest();
     });
     controls.append(practiceBtn);
@@ -147,43 +230,74 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     controls.append(hintsBtn);
 
     controls.append(el("span", "sep", "|"));
-    // en entraînement, la cible est la médiane de tes entraînements (pas des tests normaux)
-    const paceName = mode === "practice" ? "⏱ Rythme entraînement" : "⏱ Rythme";
-    const paceKind = mode === "practice" ? "entraînements" : "tests";
-    const paceLabel =
-      paceWpm !== null ? `${paceName} ${fmt(paceWpm)}` : paceName;
+    // rythme : cycle off → médiane → record. En entraînement, la médiane est
+    // celle de tes entraînements (pas des tests normaux).
+    const target = cfg.paceTarget === "record" ? "record" : "médiane";
+    const paceBase = mode === "practice" ? "⏱ Rythme entraîn." : "⏱ Rythme";
+    const paceName = cfg.paceCaret ? `${paceBase} (${target})` : paceBase;
+    const paceLabel = cfg.paceCaret && paceWpm !== null ? `${paceName} ${fmt(paceWpm)}` : paceName;
     const paceBtn = el("button", "chip-btn", paceLabel);
     if (cfg.paceCaret) paceBtn.classList.add("on");
-    paceBtn.title =
-      paceWpm !== null
-        ? `Curseur fantôme avançant à ta vitesse médiane sur tes ${cfg.paceAvgCount} derniers ${paceKind} (${fmt(paceWpm)} wpm)`
-        : `Curseur fantôme à ta vitesse médiane — fais d'abord quelques ${paceKind} dans cette langue`;
+    paceBtn.title = cfg.paceCaret
+      ? cfg.paceTarget === "record"
+        ? "Curseur fantôme calé sur ton record pour cette configuration"
+        : `Curseur fantôme à ta vitesse médiane sur tes ${cfg.paceAvgCount} derniers tests`
+      : "Curseur fantôme désactivé — clique pour courser ta médiane, puis ton record";
     paceBtn.addEventListener("click", () => {
-      cfg.paceCaret = !cfg.paceCaret;
+      if (!cfg.paceCaret) {
+        cfg.paceCaret = true;
+        cfg.paceTarget = "median";
+      } else if (cfg.paceTarget === "median") {
+        cfg.paceTarget = "record";
+      } else {
+        cfg.paceCaret = false;
+        cfg.paceTarget = "median";
+      }
       saveConfig(cfg);
-      renderControls();
-      if (!cfg.paceCaret) paceCaret.hidden = true;
+      newTest();
     });
     controls.append(paceBtn);
   }
 
-  function buildWordList(): string[] {
+  /** Nombre de mots à générer (mode durée : marge large pour le flux continu). */
+  function targetCount(): number {
+    return cfg.testKind === "time" ? Math.max(40, cfg.duration * 3) : cfg.wordCount;
+  }
+
+  /** Applique la ponctuation si activée (jamais en entraînement ni sur le pool code). */
+  function maybePunct(words: string[]): WordInput[] {
+    if (cfg.punctuation && cfg.lang !== "code" && mode === "normal") {
+      return decoratePunctuation(words);
+    }
+    return words;
+  }
+
+  function buildWordList(): WordInput[] {
+    const count = targetCount();
     if (mode === "practice") {
+      if (drillWord) {
+        return generateWordDrill(drillWord, count, LANGS[cfg.lang].words);
+      }
       if (forcedPool && forcedPool.length > 0) {
         const out: string[] = [];
-        for (let i = 0; i < cfg.wordCount; i++) {
+        for (let i = 0; i < count; i++) {
           out.push(forcedPool[Math.floor(Math.random() * forcedPool.length)] as string);
         }
         return out;
       }
-      const practice = generatePractice(cfg.lang, cfg.wordCount, cfg, stats);
+      const practice =
+        practiceKind === "bigrams"
+          ? generateBigramPractice(cfg.lang, count, loadBigramStats(cfg.lang))
+          : generatePractice(cfg.lang, count, cfg, stats);
       if (practice) return practice;
       toast(
-        "Pas encore assez de données pour l'entraînement — fais d'abord quelques tests !"
+        practiceKind === "bigrams"
+          ? "Pas encore assez de bigrammes mesurés — fais d'abord quelques tests !"
+          : "Pas encore assez de données pour l'entraînement — fais d'abord quelques tests !"
       );
       mode = "normal";
     }
-    return generateWords(cfg.lang, cfg.wordCount);
+    return maybePunct(generateWords(cfg.lang, count));
   }
 
   /** Le rythme n'est réellement affiché que s'il est activé ET qu'on a une cible. */
@@ -191,20 +305,35 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     return cfg.paceCaret && paceWpm !== null;
   }
 
-  /** Écrit le test courant au journal brut (une seule fois). */
-  function logTest(completed: boolean): void {
+  /**
+   * Écrit le test courant au journal brut (une seule fois). `at` fixe la date de
+   * l'entrée : pour un test terminé, on la cale sur `result.date` afin que
+   * journal et historique partagent le même identifiant (suppression manuelle).
+   */
+  function logTest(completed: boolean, at: number = Date.now()): void {
     if (logged || !engine || engine.startedAt === null) return;
+    // pause prolongée : l'utilisateur s'est arrêté, les mesures sont faussées —
+    // on n'écrit rien au journal (on marque quand même le test comme traité).
+    if (engine.abandonedByPause) {
+      logged = true;
+      return;
+    }
     const attempts = engine.wordAttempts();
     if (attempts.length === 0) return;
+    const agg = engine.aggregates();
+    agg.dwellAvg = dwellN > 0 ? dwellSum / dwellN : 0;
+    agg.roll = keyDownN > 0 ? rollCount / keyDownN : 0;
     appendTestLog({
-      date: Date.now(),
+      date: at,
       lang: engine.lang,
       mode: engine.mode,
       pace: paceActive(),
       paceWpm: paceActive() ? paceWpm : null,
       hints: cfg.hints && cfg.colorBy !== "off",
-      wordCount: engine.words.length,
+      wordCount: cfg.testKind === "time" ? cfg.duration : engine.words.length,
       completed,
+      sudden: cfg.sudden,
+      agg,
       words: attempts.map((a) => ({
         text: a.text,
         index: a.index,
@@ -212,6 +341,10 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
         timeMs: a.timeMs,
         errors: a.errors,
         correct: a.correct,
+        startGapMs: a.startGapMs,
+        line: a.line,
+        paceD: a.paceD,
+        bks: a.bks,
       })),
     });
     logged = true;
@@ -225,13 +358,24 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
 
   function newTest(): void {
     flushPartial();
+    window.clearTimeout(timeTimer);
+    dwellSum = dwellN = rollCount = keyDownN = keysHeld = 0;
+    keyDownAt.clear();
     cfg = loadConfig();
     stats = loadWordStats(cfg.lang);
     okSpeeds = okWpmMedianByWord(cfg.lang);
     buildSpeedDist();
     engine = new TestEngine(buildWordList(), cfg.lang, mode);
     logged = false;
-    paceWpm = paceTargetWpm(cfg.lang, cfg.paceAvgCount, mode);
+    paceWpm =
+      cfg.paceTarget === "record"
+        ? bestRecord({
+            lang: cfg.lang,
+            mode,
+            kind: cfg.testKind,
+            target: cfg.testKind === "time" ? cfg.duration : cfg.wordCount,
+          })
+        : paceTargetWpm(cfg.lang, cfg.paceAvgCount, mode);
     resultScreen.hidden = true;
     testScreen.hidden = false;
     renderControls();
@@ -248,16 +392,33 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
   }
 
   function renderAllWords(): void {
+    // en mode lisse, le curseur flottant remplace le trait par lettre (masqué en CSS)
+    wordsEl.classList.toggle("smooth-caret", cfg.smoothCaret);
     wordsEl.innerHTML = "";
     wordEls = [];
     for (let i = 0; i < engine.words.length; i++) {
       const wordEl = el("span", "word");
-      decorateSpeed(wordEl, engine.words[i]!.text);
+      const w = engine.words[i]!;
+      decorateSpeed(wordEl, w.base ?? w.text);
       wordsEl.append(wordEl, document.createTextNode(" "));
       wordEls.push(wordEl);
       renderWord(i);
     }
     scrollToActive();
+    markLines();
+  }
+
+  /** Marque le premier mot de chaque ligne visuelle (pour l'analyse « saut de ligne »). */
+  function markLines(): void {
+    let prevTop = -Infinity;
+    for (let i = 0; i < wordEls.length; i++) {
+      const node = wordEls[i];
+      const w = engine.words[i];
+      if (!node || !w) continue;
+      const top = node.offsetTop;
+      w.line = top > prevTop + 1;
+      prevTop = top;
+    }
   }
 
   /** Vitesse retenue d'un mot : hors erreur si dispo, sinon moyenne globale. */
@@ -305,7 +466,7 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
    */
   function practiceUnderline(word: TestWord): number[] | null {
     if (!cfg.hints || mode !== "practice") return null;
-    const stat = stats[word.text];
+    const stat = stats[word.base ?? word.text];
     if (!stat || stat.attempts < 2) return null;
     const rates = wordPosErrorRates(stat, word.text.length);
     const worst = Math.max(0, ...rates);
@@ -322,7 +483,7 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
   function errIntensities(word: TestWord): number[] | null {
     if (!cfg.hints) return null;
     if (cfg.colorBy !== "errors" && cfg.colorBy !== "both") return null;
-    const stat = stats[word.text];
+    const stat = stats[word.base ?? word.text];
     if (!stat || stat.attempts < cfg.minAttempts) return null;
     if (wordErrRate(stat) < cfg.errWarnRate) return null;
     const rates = wordPosErrorRates(stat, word.text.length);
@@ -357,7 +518,7 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
       if (errI > 0 && p >= word.typed.length) {
         letter.classList.add("err-mark");
         letter.style.setProperty("--err-i", errI.toFixed(3));
-        const st = stats[word.text];
+        const st = stats[word.base ?? word.text];
         const pct = Math.round(
           ((st?.posErrors?.[p] ?? 0) / Math.max(1, st?.attempts ?? 1)) * 100
         );
@@ -402,8 +563,17 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
       return;
     }
     const elapsed = performance.now() - engine.startedAt;
+    // Fantôme équitable : le WPM net ne compte que les mots parfaits. Pour qu'«
+    // arriver avec le fantôme » = même vitesse HORS erreur, on décale le fantôme
+    // en avant des caractères des mots validés fautés (le fantôme, lui, n'a pas
+    // à les « payer »). L'utilisateur doit donc les rattraper en net.
+    let penalty = 0;
+    for (let i = 0; i < engine.index; i++) {
+      const w = engine.words[i];
+      if (w && w.endMs !== undefined && w.typed !== w.text) penalty += w.text.length + 1;
+    }
     // WPM = (caractères / 5) / minutes  →  caractères = WPM * 5 * minutes
-    let remaining = (paceWpm * 5 * elapsed) / 60000;
+    let remaining = (paceWpm * 5 * elapsed) / 60000 + penalty;
 
     let wi = 0;
     for (; wi < engine.words.length - 1; wi++) {
@@ -451,10 +621,41 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     paceCaret.style.height = `${refLetter.offsetHeight}px`;
   }
 
+  /**
+   * Positionne le curseur lisse sur la lettre active et le laisse glisser (la
+   * transition CSS anime le déplacement entre deux frappes). Coordonnées prises
+   * via getBoundingClientRect pour rester juste quel que soit l'offsetParent.
+   */
+  function updateLiveCaret(): void {
+    if (!cfg.smoothCaret || engine.finished) {
+      liveCaret.hidden = true;
+      return;
+    }
+    const mid = wordsEl.querySelector<HTMLElement>(".letter.caret");
+    const ref = mid ?? wordsEl.querySelector<HTMLElement>(".letter.caret-end");
+    if (!ref) {
+      liveCaret.hidden = true;
+      return;
+    }
+    const wrap = wordsWrap.getBoundingClientRect();
+    const box = wordsEl.getBoundingClientRect();
+    const r = ref.getBoundingClientRect();
+    const y = r.top - wrap.top;
+    if (r.bottom < box.top - 1 || r.top > box.bottom + 1) {
+      liveCaret.hidden = true;
+      return;
+    }
+    liveCaret.hidden = false;
+    liveCaret.style.left = `${(mid ? r.left : r.right) - wrap.left}px`;
+    liveCaret.style.top = `${y}px`;
+    liveCaret.style.height = `${r.height}px`;
+  }
+
   function startPaceLoop(): void {
     cancelAnimationFrame(paceRaf);
     const loop = () => {
       updatePaceCaret();
+      updateLiveCaret();
       if (!engine.finished) paceRaf = requestAnimationFrame(loop);
     };
     paceRaf = requestAnimationFrame(loop);
@@ -468,56 +669,214 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
       }tape pour démarrer</span>`;
       return;
     }
-    const wpm = engine.liveWpm(performance.now());
+    const now = performance.now();
+    const wpm = engine.liveWpm(now);
     const acc = engine.liveAccuracy();
+    let progress: string;
+    if (cfg.testKind === "time" && engine.startedAt !== null) {
+      const left = Math.max(0, cfg.duration - (now - engine.startedAt) / 1000);
+      progress = `${fmt(left)} s`;
+    } else {
+      progress = `${engine.index}/${engine.words.length}`;
+    }
     liveStats.innerHTML =
       `<span>${fmt(wpm)} wpm</span>` +
       `<span class="dim">${fmt(acc * 100)} %</span>` +
-      `<span class="dim">${engine.index}/${engine.words.length}</span>`;
+      `<span class="dim">${progress}</span>`;
+  }
+
+  /** Écart-type du wpm par mot dans le test (régularité intra-test). */
+  function testConsistency(result: { words: { timeMs: number | null; text: string }[] }): number {
+    const wpms: number[] = [];
+    for (const w of result.words) {
+      if (w.timeMs !== null && w.timeMs > 0) wpms.push(w.text.length / 5 / (w.timeMs / 60000));
+    }
+    if (wpms.length < 2) return 0;
+    const mean = wpms.reduce((a, b) => a + b, 0) / wpms.length;
+    return Math.sqrt(wpms.reduce((a, b) => a + (b - mean) ** 2, 0) / wpms.length);
   }
 
   function finish(): void {
     window.clearInterval(liveTimer);
+    window.clearTimeout(timeTimer);
     cancelAnimationFrame(paceRaf);
     paceCaret.hidden = true;
+    // pause prolongée pendant le test → écarté des stats (voir renderDiscarded)
+    if (engine.abandonedByPause) {
+      logged = true; // rien à journaliser (flushPartial ultérieur ne fera rien)
+      renderDiscarded();
+      return;
+    }
     const result = engine.result();
-    applyResult(result, engine.bigrams);
-    logTest(true);
+    const target = cfg.testKind === "time" ? cfg.duration : cfg.wordCount;
+    const meta = { lang: cfg.lang, mode, kind: cfg.testKind, target };
+    // record calculé AVANT d'ajouter le test à l'historique (sinon il se bat lui-même)
+    const newRecord = saveRecord(meta, result.wpm, result.date);
+    applyResult(result, engine.bigrams, {
+      kind: cfg.testKind,
+      target,
+      consistency: testConsistency(result),
+    });
+    logTest(true, result.date);
+    // instantané pour une éventuelle suppression manuelle (l'engine sera remplacé
+    // au prochain test) : on garde de quoi défaire exactement cet enregistrement.
+    const savedBigrams = engine.bigrams;
+    const savedLang = engine.lang;
+    const revertMeta = { kind: cfg.testKind, target };
+    let deleted = false;
     testScreen.hidden = true;
     resultScreen.hidden = false;
-    renderResults(resultScreen, result, {
-      onRestart: () => {
-        forcedPool = null;
-        newTest();
+    renderResults(
+      resultScreen,
+      result,
+      {
+        onRestart: () => {
+          forcedPool = null;
+          newTest();
+        },
+        onPracticeWords: (words) => {
+          if (words.length === 0) {
+            toast("Aucun mot à retravailler dans ce test, bien joué !");
+            return;
+          }
+          mode = "practice";
+          forcedPool = words;
+          newTest();
+        },
+        onDelete: () => {
+          if (deleted) return; // garde-fou : une seule suppression
+          deleted = true;
+          revertResult(result, savedBigrams, revertMeta);
+          removeTestLog(savedLang, result.date);
+          toast("Test supprimé — retiré de tes statistiques.");
+          forcedPool = null;
+          newTest();
+        },
       },
-      onPracticeWords: (words) => {
-        if (words.length === 0) {
-          toast("Aucun mot à retravailler dans ce test, bien joué !");
-          return;
-        }
-        mode = "practice";
-        forcedPool = words;
-        newTest();
-      },
-    });
+      { newRecord }
+    );
+  }
+
+  /** Avance du fantôme (en caractères) à l'instant `now`. */
+  function ghostCharsAt(now: number): number {
+    if (paceWpm === null || engine.startedAt === null) return 0;
+    return (paceWpm * 5 * (now - engine.startedAt)) / 60000;
+  }
+  /** Offset (en caractères) du début du mot i dans le flux (lettres + espaces). */
+  function wordCharOffset(i: number): number {
+    let off = 0;
+    for (let j = 0; j < i; j++) off += (engine.words[j]?.text.length ?? 0) + 1;
+    return off;
   }
 
   function handleChar(ch: string): void {
     const prevIndex = engine.index;
-    const ev = engine.typeChar(ch, performance.now());
+    const w = engine.words[prevIndex];
+    const firstOfWord = !!w && w.typed.length === 0 && ch !== " ";
+    const wasIdle = engine.startedAt === null;
+    const now = performance.now();
+    const ev = engine.typeChar(ch, now);
     if (ev === "ignore") return;
+    // démarrage du chrono en mode durée, à la première frappe
+    if (wasIdle && engine.startedAt !== null && cfg.testKind === "time") {
+      timeTimer = window.setTimeout(() => {
+        engine.forceFinish(performance.now());
+        finish();
+      }, cfg.duration * 1000);
+    }
+    // mort subite : la moindre frappe fausse arrête le test
+    if (cfg.sudden && ch !== " " && !engine.finished) {
+      const last = engine.keystrokes[engine.keystrokes.length - 1];
+      if (last && !last.correct) {
+        renderWord(prevIndex);
+        renderSuddenFail();
+        return;
+      }
+    }
+    // échantillon d'avance/retard sur le fantôme à la 1re frappe du mot
+    if (firstOfWord && w && paceActive()) {
+      w.paceD = Math.round(wordCharOffset(prevIndex) - ghostCharsAt(now));
+    }
     renderWord(prevIndex);
     if (engine.index !== prevIndex && !engine.finished) {
       renderWord(engine.index);
       scrollToActive();
+      // flux continu du mode durée : recharge des mots avant d'atteindre la fin
+      if (cfg.testKind === "time" && engine.index > engine.words.length - 25) {
+        engine.appendWords(maybePunct(generateWords(cfg.lang, 40)));
+        renderAllWords();
+      }
     }
     updateLive();
     if (ev === "finish") finish();
   }
 
+  /**
+   * Écran affiché quand le test est écarté : une pause d'au moins
+   * {@link IDLE_ABANDON_MS} a été détectée (l'utilisateur s'est arrêté). Rien
+   * n'est enregistré — ni stats, ni historique, ni record, ni journal.
+   */
+  function renderDiscarded(): void {
+    window.clearInterval(liveTimer);
+    window.clearTimeout(timeTimer);
+    cancelAnimationFrame(paceRaf);
+    paceCaret.hidden = true;
+    testScreen.hidden = true;
+    resultScreen.hidden = false;
+    resultScreen.innerHTML = "";
+    const box = el("div", "sudden-fail");
+    box.append(el("div", "sf-title gold-metal", "⏸ Test ignoré"));
+    box.append(
+      el(
+        "div",
+        "sf-sub",
+        `Pause de ${fmt(engine.maxIdleMs / 1000)} s détectée — tu semblais parti. ` +
+          "Rien n'a été enregistré pour ne pas fausser tes stats."
+      )
+    );
+    const btn = el("button", "btn primary", "Recommencer (Tab)");
+    btn.addEventListener("click", () => {
+      forcedPool = null;
+      newTest();
+    });
+    box.append(btn);
+    resultScreen.append(box);
+  }
+
+  /** Écran « raté » de la mort subite (pas d'entrée d'historique, journal partiel). */
+  function renderSuddenFail(): void {
+    window.clearInterval(liveTimer);
+    window.clearTimeout(timeTimer);
+    cancelAnimationFrame(paceRaf);
+    paceCaret.hidden = true;
+    logTest(false);
+    testScreen.hidden = true;
+    resultScreen.hidden = false;
+    resultScreen.innerHTML = "";
+    const box = el("div", "sudden-fail");
+    box.append(el("div", "sf-title gold-metal", "☠ Raté"));
+    box.append(
+      el(
+        "div",
+        "sf-sub",
+        `Une faute en mort subite après ${engine.index} mot(s) parfait(s).`
+      )
+    );
+    box.append(
+      el("div", "sf-wpm", `${fmt(engine.liveWpm(performance.now()))} wpm au moment de la chute`)
+    );
+    const btn = el("button", "btn primary", "Recommencer (Tab)");
+    btn.addEventListener("click", () => {
+      forcedPool = null;
+      newTest();
+    });
+    box.append(btn);
+    resultScreen.append(box);
+  }
+
   function handleBackspace(): void {
     const prevIndex = engine.index;
-    if (engine.backspace() === "ignore") return;
+    if (engine.backspace(performance.now()) === "ignore") return;
     renderWord(prevIndex);
     if (engine.index !== prevIndex) {
       renderWord(engine.index);
@@ -530,7 +889,7 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     const prevIndex = engine.index;
     let changed = false;
     while (engine.current.typed.length > 0) {
-      if (engine.backspace() === "ignore") break;
+      if (engine.backspace(performance.now()) === "ignore") break;
       changed = true;
     }
     if (changed) renderWord(prevIndex);
@@ -566,6 +925,13 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
   document.addEventListener(
     "keydown",
     (e) => {
+      // dwell time & rollover : uniquement les touches « caractère », hors répétition
+      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey && !e.repeat) {
+        keyDownN += 1;
+        if (keysHeld > 0) rollCount += 1; // une frappe alors qu'une touche est tenue
+        keysHeld += 1;
+        keyDownAt.set(e.code, e.timeStamp);
+      }
       if (e.key === "Tab" || e.key === "Escape") {
         e.preventDefault();
         forcedPool = null;
@@ -578,6 +944,22 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
         e.preventDefault();
         if (e.ctrlKey || e.altKey || e.metaKey) handleDeleteWord();
         else handleBackspace();
+      }
+    },
+    { signal }
+  );
+
+  document.addEventListener(
+    "keyup",
+    (e) => {
+      const down = keyDownAt.get(e.code);
+      if (down === undefined) return;
+      keyDownAt.delete(e.code);
+      keysHeld = Math.max(0, keysHeld - 1);
+      const d = e.timeStamp - down;
+      if (d > 0 && d < 1000) {
+        dwellSum += d;
+        dwellN += 1;
       }
     },
     { signal }
@@ -598,9 +980,28 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
 
   signal.addEventListener("abort", () => {
     window.clearInterval(liveTimer);
+    window.clearTimeout(timeTimer);
     cancelAnimationFrame(paceRaf);
     flushPartial(); // changement d'onglet (Stats/Réglages) en plein test
   });
+
+  // relais depuis l'onglet Stats : réviser un mot précis en boucle
+  try {
+    const raw = sessionStorage.getItem("ft:drill");
+    if (raw) {
+      sessionStorage.removeItem("ft:drill");
+      const { lang, word } = JSON.parse(raw) as { lang: LangId; word: string };
+      if (LANGS[lang]) {
+        cfg.lang = lang;
+        saveConfig(cfg);
+        mode = "practice";
+        drillWord = word;
+        toast(`Révision du mot « ${word} »`);
+      }
+    }
+  } catch {
+    // relais illisible : test normal
+  }
 
   newTest();
 }

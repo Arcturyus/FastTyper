@@ -2,12 +2,14 @@ import type {
   BigramStat,
   HistoryEntry,
   LangId,
+  TestKind,
   TestLog,
   TestMode,
   TestResult,
   WordStat,
 } from "./types";
 import { ALL_FAMILIES, FAMILY_OF, type LangFamily } from "./lang";
+import { storage } from "./db";
 
 // les clés de stockage sont partagées par famille (fr/fr1k → "fr", en/en1k → "en") :
 // un mot pratiqué dans un pool profite immédiatement à l'autre taille de pool.
@@ -20,7 +22,7 @@ const TESTLOG_MAX = 1500; // tests bruts conservés par famille (terminés + aba
 
 function read<T>(key: string, fallback: T): T {
   try {
-    const raw = localStorage.getItem(key);
+    const raw = storage.getItem(key);
     return raw ? (JSON.parse(raw) as T) : fallback;
   } catch {
     return fallback;
@@ -35,7 +37,7 @@ function read<T>(key: string, fallback: T): T {
 //  clé. Exécuté une seule fois au chargement du module.
 // ---------------------------------------------------------------------------
 const STORAGE_VERSION_KEY = "ft:storageVersion";
-const SECONDARY_VARIANT: Record<LangFamily, LangId> = { fr: "fr1k", en: "en1k" };
+const SECONDARY_VARIANT: Partial<Record<LangFamily, LangId>> = { fr: "fr1k", en: "en1k" };
 
 function mergeWordStat(a: WordStat, b: WordStat): WordStat {
   const len = Math.max(a.posErrors?.length ?? 0, b.posErrors?.length ?? 0);
@@ -85,22 +87,23 @@ function mergeLegacyBucket<T>(
   merge: (a: T, b: T) => T,
   empty: T
 ): void {
-  const raw = localStorage.getItem(legacyKey);
+  const raw = storage.getItem(legacyKey);
   if (!raw) return;
   try {
     const legacy = JSON.parse(raw) as T;
     const current = read(targetKey, empty);
-    localStorage.setItem(targetKey, JSON.stringify(merge(current, legacy)));
+    storage.setItem(targetKey, JSON.stringify(merge(current, legacy)));
   } catch {
     // données corrompues : on abandonne la fusion mais on nettoie quand même la clé
   }
-  localStorage.removeItem(legacyKey);
+  storage.removeItem(legacyKey);
 }
 
 function migrateToFamilyStorage(): void {
-  if (localStorage.getItem(STORAGE_VERSION_KEY) === "2") return;
+  if (storage.getItem(STORAGE_VERSION_KEY) === "2") return;
   for (const family of ALL_FAMILIES) {
     const secondary = SECONDARY_VARIANT[family];
+    if (!secondary) continue; // familles sans variante héritée (ex. code)
     mergeLegacyBucket(`ft:words:${secondary}`, wordsKey(family), mergeWordStatsRecords, {});
     mergeLegacyBucket(`ft:bigrams:${secondary}`, bigramsKey(family), mergeBigramStatsRecords, {});
     mergeLegacyBucket<TestLog[]>(
@@ -110,10 +113,16 @@ function migrateToFamilyStorage(): void {
       []
     );
   }
-  localStorage.setItem(STORAGE_VERSION_KEY, "2");
+  storage.setItem(STORAGE_VERSION_KEY, "2");
 }
 
-migrateToFamilyStorage();
+/**
+ * Initialise le stockage : migration par famille. À appeler APRÈS `initDb()`
+ * (le cache mémoire doit être chargé) et avant tout accès aux stats.
+ */
+export function initStore(): void {
+  migrateToFamilyStorage();
+}
 
 export function loadWordStats(lang: LangId): Record<string, WordStat> {
   return read(wordsKey(lang), {});
@@ -136,10 +145,19 @@ export function appendTestLog(entry: TestLog): void {
   if (entry.words.length === 0) return;
   const log = loadTestLog(entry.lang);
   log.push(entry);
-  localStorage.setItem(
+  storage.setItem(
     testLogKey(entry.lang),
     JSON.stringify(log.slice(-TESTLOG_MAX))
   );
+}
+
+/** Retire du journal brut l'entrée datée `date` (suppression manuelle d'un test). */
+export function removeTestLog(lang: LangId, date: number): void {
+  const log = loadTestLog(lang);
+  const next = log.filter((t) => t.date !== date);
+  if (next.length !== log.length) {
+    storage.setItem(testLogKey(lang), JSON.stringify(next));
+  }
 }
 
 /** Médiane d'une liste (copie triée), ou null si vide. */
@@ -367,7 +385,8 @@ export function wordPosErrorRates(s: WordStat, wordLen: number): number[] {
 /** Intègre un résultat de test dans les stats persistées */
 export function applyResult(
   result: TestResult,
-  bigrams: Map<string, BigramStat>
+  bigrams: Map<string, BigramStat>,
+  meta?: { kind?: TestKind; target?: number; consistency?: number }
 ): void {
   const stats = loadWordStats(result.lang);
   for (const w of result.words) {
@@ -396,7 +415,7 @@ export function applyResult(
     s.last = result.date;
     stats[w.text] = s;
   }
-  localStorage.setItem(wordsKey(result.lang), JSON.stringify(stats));
+  storage.setItem(wordsKey(result.lang), JSON.stringify(stats));
 
   const bg = loadBigramStats(result.lang);
   for (const [key, b] of bigrams) {
@@ -406,7 +425,7 @@ export function applyResult(
     cur.errors += b.errors;
     bg[key] = cur;
   }
-  localStorage.setItem(bigramsKey(result.lang), JSON.stringify(bg));
+  storage.setItem(bigramsKey(result.lang), JSON.stringify(bg));
 
   const history = loadHistory();
   history.push({
@@ -417,20 +436,223 @@ export function applyResult(
     durationMs: result.durationMs,
     wpm: result.wpm,
     accuracy: result.accuracy,
+    kind: meta?.kind,
+    target: meta?.target,
+    consistency: meta?.consistency,
   });
-  localStorage.setItem(
+  storage.setItem(
     HISTORY_KEY,
     JSON.stringify(history.slice(-HISTORY_MAX))
   );
 }
 
-export const ALL_LANGS: LangId[] = ["fr", "fr1k", "en", "en1k"];
+/**
+ * Défait exactement l'intégration d'un test : inverse de {@link applyResult}
+ * (stats par mot, bigrammes, historique) et recalcule le record de la config
+ * concernée. Le journal brut est retiré à part via {@link removeTestLog}. Sert à
+ * la suppression manuelle d'un test qu'on ne veut pas compter.
+ */
+export function revertResult(
+  result: TestResult,
+  bigrams: Map<string, BigramStat>,
+  meta?: { kind?: TestKind; target?: number }
+): void {
+  const stats = loadWordStats(result.lang);
+  for (const w of result.words) {
+    const s = stats[w.text];
+    if (!s) continue;
+    s.attempts -= 1;
+    s.errors = Math.max(0, s.errors - w.errors);
+    if (w.errors > 0) s.errorAttempts = Math.max(0, s.errorAttempts - 1);
+    if (s.posErrors) {
+      for (let p = 0; p < w.posErrors.length; p++) {
+        s.posErrors[p] = Math.max(0, (s.posErrors[p] ?? 0) - (w.posErrors[p] ?? 0));
+      }
+    }
+    if (w.timeMs !== null && w.timeMs > 0) {
+      s.timeMs = Math.max(0, s.timeMs - w.timeMs);
+      s.timedChars = Math.max(0, s.timedChars - w.text.length);
+      s.timedAttempts = Math.max(0, s.timedAttempts - 1);
+    }
+    if (s.attempts <= 0) delete stats[w.text];
+    else stats[w.text] = s;
+  }
+  storage.setItem(wordsKey(result.lang), JSON.stringify(stats));
+
+  const bg = loadBigramStats(result.lang);
+  for (const [key, b] of bigrams) {
+    const cur = bg[key];
+    if (!cur) continue;
+    cur.count = Math.max(0, cur.count - b.count);
+    cur.gapMs = Math.max(0, cur.gapMs - b.gapMs);
+    cur.errors = Math.max(0, cur.errors - b.errors);
+    if (cur.count === 0 && cur.errors === 0) delete bg[key];
+    else bg[key] = cur;
+  }
+  storage.setItem(bigramsKey(result.lang), JSON.stringify(bg));
+
+  // historique : on retire une entrée de même date (identifiant du test)
+  const history = loadHistory();
+  const idx = history.findIndex((h) => h.date === result.date && h.lang === result.lang);
+  if (idx >= 0) {
+    history.splice(idx, 1);
+    storage.setItem(HISTORY_KEY, JSON.stringify(history));
+  }
+
+  // record : le test supprimé le détenait peut-être — on le recalcule depuis
+  // l'historique désormais amputé.
+  recomputeRecord({
+    lang: result.lang,
+    mode: result.mode,
+    kind: meta?.kind,
+    target: meta?.target,
+    wordCount: result.wordCount,
+  });
+}
+
+/**
+ * Supprime un test ancien repéré par (langue, date d'historique). Retire l'entrée
+ * d'historique et l'entrée de journal correspondante, défait sa contribution aux
+ * stats par mot depuis le journal, et recalcule le record de la config.
+ *
+ * Limites assumées (négligeables pour un nettoyage ponctuel) : les `posErrors`
+ * par position et les bigrammes ne sont pas stockés par test dans le journal,
+ * donc pas défaits — ils dérivent très légèrement. Pour un test tout juste
+ * terminé, préférer {@link revertResult}, qui lui est exact.
+ *
+ * Renvoie true si un test a bien été trouvé et supprimé.
+ */
+export function deleteHistoricalTest(lang: LangId, date: number): boolean {
+  const history = loadHistory();
+  const hIdx = history.findIndex((h) => h.date === date && h.lang === lang);
+  if (hIdx < 0) return false;
+  const entry = history[hIdx] as HistoryEntry;
+
+  // journal brut : l'entrée du même test. Sa date est calée sur l'historique
+  // pour les tests récents ; pour les anciens, elle diffère de quelques ms — on
+  // prend donc la plus proche dans une tolérance étroite (jamais deux tests si
+  // rapprochés).
+  const log = loadTestLog(lang);
+  let best = -1;
+  let bestDiff = Infinity;
+  for (let i = 0; i < log.length; i++) {
+    const diff = Math.abs((log[i] as TestLog).date - date);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = i;
+    }
+  }
+  if (best >= 0 && bestDiff <= 5000) {
+    const stats = loadWordStats(lang);
+    for (const w of (log[best] as TestLog).words) {
+      const s = stats[w.text];
+      if (!s) continue;
+      s.attempts -= 1;
+      s.errors = Math.max(0, s.errors - w.errors);
+      if (w.errors > 0) s.errorAttempts = Math.max(0, s.errorAttempts - 1);
+      if (w.timeMs !== null && w.timeMs > 0) {
+        s.timeMs = Math.max(0, s.timeMs - w.timeMs);
+        s.timedChars = Math.max(0, s.timedChars - w.len);
+        s.timedAttempts = Math.max(0, s.timedAttempts - 1);
+      }
+      if (s.attempts <= 0) delete stats[w.text];
+      else stats[w.text] = s;
+    }
+    storage.setItem(wordsKey(lang), JSON.stringify(stats));
+    log.splice(best, 1);
+    storage.setItem(testLogKey(lang), JSON.stringify(log));
+  }
+
+  history.splice(hIdx, 1);
+  storage.setItem(HISTORY_KEY, JSON.stringify(history));
+  recomputeRecord({
+    lang,
+    mode: entry.mode,
+    kind: entry.kind,
+    target: entry.target,
+    wordCount: entry.wordCount,
+  });
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+//  Records personnels par configuration (langue × type × cible × mode)
+// ---------------------------------------------------------------------------
+const RECORDS_KEY = "ft:records";
+type RecordEntry = { wpm: number; date: number };
+export type RecordMeta = {
+  lang: LangId;
+  mode: TestMode;
+  kind?: TestKind;
+  target?: number; // nb de mots (words) ou secondes (time)
+  wordCount?: number; // repli si target absent (anciennes entrées)
+};
+
+function recordKey(m: RecordMeta): string {
+  const kind = m.kind ?? "words";
+  const target = m.target ?? m.wordCount ?? 0;
+  return `${m.lang}|${kind}|${target}|${m.mode}`;
+}
+
+/** Charge les records, en les amorçant depuis l'historique au premier accès. */
+function loadRecords(): Record<string, RecordEntry> {
+  const existing = read<Record<string, RecordEntry> | null>(RECORDS_KEY, null);
+  if (existing) return existing;
+  const recs: Record<string, RecordEntry> = {};
+  for (const h of loadHistory()) {
+    const k = recordKey(h);
+    if (!recs[k] || h.wpm > (recs[k] as RecordEntry).wpm) recs[k] = { wpm: h.wpm, date: h.date };
+  }
+  storage.setItem(RECORDS_KEY, JSON.stringify(recs));
+  return recs;
+}
+
+/** Meilleur wpm enregistré pour cette configuration, ou null. */
+export function bestRecord(m: RecordMeta): number | null {
+  const r = loadRecords()[recordKey(m)];
+  return r ? r.wpm : null;
+}
+
+/**
+ * Enregistre le résultat s'il bat le record de sa configuration. Renvoie true
+ * seulement si un record ANTÉRIEUR a été battu (un tout premier test ne compte
+ * pas comme « record battu »). À appeler AVANT d'ajouter le test à l'historique.
+ */
+export function saveRecord(m: RecordMeta, wpm: number, date: number): boolean {
+  const recs = loadRecords();
+  const k = recordKey(m);
+  const prev = recs[k];
+  if (prev && wpm <= prev.wpm) return false;
+  recs[k] = { wpm, date };
+  storage.setItem(RECORDS_KEY, JSON.stringify(recs));
+  return !!prev; // battu seulement s'il existait déjà un record
+}
+
+/**
+ * Recalcule le record d'une configuration depuis l'historique (à appeler APRÈS
+ * en avoir retiré un test). Si plus aucun test ne correspond, la clé est purgée.
+ */
+export function recomputeRecord(m: RecordMeta): void {
+  const recs = loadRecords();
+  const k = recordKey(m);
+  let best: RecordEntry | null = null;
+  for (const h of loadHistory()) {
+    if (recordKey(h) !== k) continue;
+    if (!best || h.wpm > best.wpm) best = { wpm: h.wpm, date: h.date };
+  }
+  if (best) recs[k] = best;
+  else delete recs[k];
+  storage.setItem(RECORDS_KEY, JSON.stringify(recs));
+}
+
+export const ALL_LANGS: LangId[] = ["fr", "fr1k", "fracc", "en", "en1k", "code"];
 
 export function exportData(): string {
   const data: Record<string, unknown> = {
     version: 2,
     config: read("ft:config", null),
     history: loadHistory(),
+    records: read(RECORDS_KEY, null),
   };
   for (const family of ALL_FAMILIES) {
     data[`words:${family}`] = loadWordStats(family);
@@ -447,22 +669,27 @@ export function importData(json: string): void {
     throw new Error("Format de fichier non reconnu");
   }
   if (data["config"]) {
-    localStorage.setItem("ft:config", JSON.stringify(data["config"]));
+    storage.setItem("ft:config", JSON.stringify(data["config"]));
   }
   if (Array.isArray(data["history"])) {
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(data["history"]));
+    storage.setItem(HISTORY_KEY, JSON.stringify(data["history"]));
+  }
+  if (data["records"]) {
+    storage.setItem(RECORDS_KEY, JSON.stringify(data["records"]));
+  } else {
+    storage.removeItem(RECORDS_KEY); // ré-amorcé depuis l'historique importé
   }
 
   if (version === 2) {
     for (const family of ALL_FAMILIES) {
       if (data[`words:${family}`]) {
-        localStorage.setItem(wordsKey(family), JSON.stringify(data[`words:${family}`]));
+        storage.setItem(wordsKey(family), JSON.stringify(data[`words:${family}`]));
       }
       if (data[`bigrams:${family}`]) {
-        localStorage.setItem(bigramsKey(family), JSON.stringify(data[`bigrams:${family}`]));
+        storage.setItem(bigramsKey(family), JSON.stringify(data[`bigrams:${family}`]));
       }
       if (data[`testlog:${family}`]) {
-        localStorage.setItem(testLogKey(family), JSON.stringify(data[`testlog:${family}`]));
+        storage.setItem(testLogKey(family), JSON.stringify(data[`testlog:${family}`]));
       }
     }
     return;
@@ -472,14 +699,14 @@ export function importData(json: string): void {
   for (const lang of ALL_LANGS) {
     const words = data[`words:${lang}`] as Record<string, WordStat> | undefined;
     if (words) {
-      localStorage.setItem(
+      storage.setItem(
         wordsKey(lang),
         JSON.stringify(mergeWordStatsRecords(read(wordsKey(lang), {}), words))
       );
     }
     const bg = data[`bigrams:${lang}`] as Record<string, BigramStat> | undefined;
     if (bg) {
-      localStorage.setItem(
+      storage.setItem(
         bigramsKey(lang),
         JSON.stringify(mergeBigramStatsRecords(read(bigramsKey(lang), {}), bg))
       );
@@ -489,15 +716,15 @@ export function importData(json: string): void {
       const merged = [...read<TestLog[]>(testLogKey(lang), []), ...logs]
         .sort((a, b) => a.date - b.date)
         .slice(-TESTLOG_MAX);
-      localStorage.setItem(testLogKey(lang), JSON.stringify(merged));
+      storage.setItem(testLogKey(lang), JSON.stringify(merged));
     }
   }
 }
 
 export function resetData(): void {
-  const keys: string[] = [HISTORY_KEY];
+  const keys: string[] = [HISTORY_KEY, RECORDS_KEY];
   for (const family of ALL_FAMILIES) {
     keys.push(wordsKey(family), bigramsKey(family), testLogKey(family));
   }
-  for (const k of keys) localStorage.removeItem(k);
+  for (const k of keys) storage.removeItem(k);
 }

@@ -5,18 +5,21 @@ import type { LangId } from "./types";
  * large), en/en1k partagent l'anglais. Les stats de mots/bigrammes/journaux sont
  * stockées par famille pour que la pratique se transfère entre tailles de pool.
  */
-export type LangFamily = "fr" | "en";
+export type LangFamily = "fr" | "en" | "code";
 
 export const FAMILY_OF: Record<LangId, LangFamily> = {
   fr: "fr",
   fr1k: "fr",
+  fracc: "fr", // pool accents : partage les stats du français
   en: "en",
   en1k: "en",
+  code: "code",
 };
 
-export const ALL_FAMILIES: LangFamily[] = ["fr", "en"];
+export const ALL_FAMILIES: LangFamily[] = ["fr", "en", "code"];
 
 export const FAMILY_LABEL: Record<LangFamily, string> = {
   fr: "Français",
   en: "English",
+  code: "Code",
 };

@@ -140,6 +140,7 @@ export function progressionChart(opts: {
   categories: { key: string; label: string; color: string }[];
   yFormat?: (y: number) => string;
   maWindow?: number;
+  onPick?: (index: number, event: MouseEvent) => void; // clic sur un point
 }): HTMLElement {
   const yFormat = opts.yFormat ?? ((y) => numFmt(y));
   const win = opts.maWindow ?? Math.max(3, Math.round(opts.points.length / 12));
@@ -184,13 +185,15 @@ export function progressionChart(opts: {
   const cross = svg.append("line").attr("y1", m.top).attr("y2", H - m.bottom)
     .attr("stroke", MUTED).attr("stroke-dasharray", "3 3").style("visibility", "hidden");
   const hi = svg.append("circle").attr("r", 5.5).attr("fill", "none").attr("stroke-width", 2).style("visibility", "hidden");
-  svg.append("rect").attr("x", m.left).attr("y", m.top)
+  const nearestIndex = (event: Event): number => {
+    const mx = pointer(event)[0];
+    return Math.max(0, Math.min(pts.length - 1, Math.round(x.invert(mx))));
+  };
+  const overlay = svg.append("rect").attr("x", m.left).attr("y", m.top)
     .attr("width", W - m.left - m.right).attr("height", H - m.top - m.bottom)
     .attr("fill", "transparent")
     .on("mousemove", (event) => {
-      const mx = pointer(event)[0];
-      let i = Math.round(x.invert(mx));
-      i = Math.max(0, Math.min(pts.length - 1, i));
+      const i = nearestIndex(event);
       const p = pts[i]!;
       cross.attr("x1", x(i)).attr("x2", x(i)).style("visibility", "visible");
       hi.attr("cx", x(i)).attr("cy", y(p.y)).attr("stroke", colorOf(p.category)).style("visibility", "visible");
@@ -201,6 +204,10 @@ export function progressionChart(opts: {
       hi.style("visibility", "hidden");
       c.hideTip();
     });
+  if (opts.onPick) {
+    overlay.style("cursor", "pointer")
+      .on("click", (event: MouseEvent) => opts.onPick!(nearestIndex(event), event));
+  }
 
   c.card.append(svg.node()!);
   return c.card;

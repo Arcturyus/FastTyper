@@ -144,6 +144,19 @@ export function mountSettingsView(root: HTMLElement, signal: AbortSignal): void 
     return row;
   }
 
+  // --- affichage ---
+  const displayGroup = el("div", "settings-group");
+  displayGroup.append(el("h3", undefined, "Affichage"));
+  displayGroup.append(
+    el(
+      "p",
+      "hint",
+      "Le curseur lisse glisse d'une lettre à l'autre au lieu de sauter. Il se décale en avant quand tu valides un mot fauté, pour rester calé sur ta vitesse hors erreur."
+    )
+  );
+  displayGroup.append(checkboxRow("smoothCaret", "Curseur lisse (glissant)"));
+  root.append(displayGroup);
+
   // --- rythme ---
   const paceGroup = el("div", "settings-group");
   paceGroup.append(el("h3", undefined, "Curseur de rythme"));

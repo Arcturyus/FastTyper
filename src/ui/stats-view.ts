@@ -3,12 +3,14 @@ import {
   ALL_LANGS,
   badWpm,
   bigramAvgGap,
+  deleteHistoricalTest,
   exportData,
   importData,
   loadBigramStatsMerged,
   loadHistory,
   loadTestLogMulti,
   loadWordStatsTagged,
+  median,
   okWpm,
   resetData,
   wordAvgWpm,
@@ -53,6 +55,7 @@ import {
 const FAMILY_COLOR: Record<LangFamily, string> = {
   fr: ACCENT,
   en: PACE,
+  code: STATUS.good,
 };
 
 /** Modes filtrables dans l'en-tête — couleurs alignées sur les graphiques. */
@@ -99,7 +102,7 @@ function buildWordRows(tagged: TaggedWord[], outcome: Map<string, OutcomeSpeed>)
   });
 }
 
-type Tab = "progression" | "mots" | "biais" | "bigrammes" | "activite";
+type Tab = "progression" | "mots" | "biais" | "bigrammes" | "clavier" | "activite";
 type SortKey = "word" | "lang" | "attempts" | "wpm" | "okWpm" | "badWpm" | "errRate" | "errors";
 
 const TABS: { key: Tab; label: string }[] = [
@@ -107,6 +110,7 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "mots", label: "Mots" },
   { key: "biais", label: "Biais" },
   { key: "bigrammes", label: "Bigrammes" },
+  { key: "clavier", label: "Clavier" },
   { key: "activite", label: "Activité" },
 ];
 
@@ -232,6 +236,14 @@ export function mountStatsView(root: HTMLElement, signal: AbortSignal): void {
       case "bigrammes":
         renderBigrams(content, loadBigramStatsMerged(families));
         break;
+      case "clavier":
+        renderKeyboard(
+          content,
+          loadBigramStatsMerged(families),
+          loadTestLogMulti(families).filter((t) => selectedModes.has(t.mode)),
+          signal
+        );
+        break;
       case "activite":
         renderActivity(content, history, root, signal);
         break;
@@ -276,13 +288,18 @@ function renderProgression(
     if (hint) tile.append(el("div", "tile-hint", hint));
     return tile;
   };
+  const consistVals = history
+    .map((h) => h.consistency)
+    .filter((c): c is number => typeof c === "number" && c > 0);
+  const consistMed = consistVals.length ? median(consistVals) : null;
   cards.append(
     mk("tests", fmt(fullHistory.length)),
     mk("wpm moyen", fmt(avgRecent), "10 derniers"),
     mk("wpm médian", recentStat ? fmt(recentStat.median) : "—", "10 derniers"),
     mk("record", fmt(best)),
     mk("précision", fmtPct(avgAcc)),
-    mk("régularité", stat ? "± " + fmt(stat.sd) : "—", "écart-type wpm"),
+    mk("régularité", stat ? "± " + fmt(stat.sd) : "—", "écart-type entre tests"),
+    mk("consistance", consistMed !== null ? "± " + fmt(consistMed) : "—", "écart-type dans un test"),
     mk("temps frappé", fmtDuration(totalMs)),
     mk("mots suivis", fmt(trackedWords))
   );
@@ -317,12 +334,66 @@ function renderProgression(
     .map((m) => ({ key: m.key as string, label: m.label, color: m.color }));
   const progHost = el("div");
   root.append(progHost);
+
+  // --- suppression d'un test par clic sur son point ---
+  let popover: HTMLElement | null = null;
+  let onDocDown: ((e: MouseEvent) => void) | null = null;
+  let onKey: ((e: KeyboardEvent) => void) | null = null;
+  function closePopover(): void {
+    if (onDocDown) { document.removeEventListener("mousedown", onDocDown, true); onDocDown = null; }
+    if (onKey) { document.removeEventListener("keydown", onKey, true); onKey = null; }
+    if (popover) { popover.remove(); popover = null; }
+  }
+  signal.addEventListener("abort", closePopover);
+  function pickTest(index: number, event: MouseEvent): void {
+    closePopover();
+    const t = history[index];
+    if (!t) return;
+    const box = el("div", "test-popover");
+    const modeLabel = t.mode === "practice" ? "entraînement" : "normal";
+    box.append(
+      el("div", "tp-head", `Test #${index + 1}`),
+      el("div", "tp-sub", `${fmtDate(t.date)} · ${fmt(t.wpm)} wpm · ${fmtPct(t.accuracy)} · ${modeLabel}`)
+    );
+    const del = el("button", "btn danger", "🗑 Supprimer ce test");
+    del.addEventListener("click", () => {
+      if (del.classList.contains("confirm")) {
+        deleteHistoricalTest(t.lang, t.date);
+        closePopover();
+        toast("Test supprimé — retiré de tes statistiques.");
+        rerender();
+        return;
+      }
+      del.classList.add("confirm");
+      del.textContent = "Confirmer la suppression ?";
+    }, { signal });
+    box.append(del);
+    document.body.append(box);
+    // positionnement près du clic, en restant dans la fenêtre
+    const pad = 8;
+    const r = box.getBoundingClientRect();
+    let left = event.clientX + pad;
+    let top = event.clientY + pad;
+    if (left + r.width > window.innerWidth - pad) left = event.clientX - r.width - pad;
+    if (top + r.height > window.innerHeight - pad) top = event.clientY - r.height - pad;
+    box.style.left = `${Math.max(pad, left)}px`;
+    box.style.top = `${Math.max(pad, top)}px`;
+    popover = box;
+    // le mousedown initiateur est déjà passé : ces écouteurs ne captent que les
+    // clics/échap suivants, pour refermer la pop-up.
+    onDocDown = (e) => { if (popover && !popover.contains(e.target as Node)) closePopover(); };
+    onKey = (e) => { if (e.key === "Escape") closePopover(); };
+    document.addEventListener("mousedown", onDocDown, true);
+    document.addEventListener("keydown", onKey, true);
+  }
+
   function drawProg(): void {
+    closePopover();
     progHost.innerHTML = "";
     progHost.append(
       progressionChart({
         title: "Progression du WPM",
-        subtitle: `${history.length} test(s)`,
+        subtitle: `${history.length} test(s) · clique un point pour supprimer ce test`,
         points: history.map((h) => ({
           y: h.wpm,
           category: h.mode,
@@ -330,6 +401,7 @@ function renderProgression(
         })),
         categories: progCats,
         maWindow: win,
+        onPick: pickTest,
       })
     );
   }
@@ -352,6 +424,25 @@ function renderProgression(
       })
     );
     root.append(meanMedianNote(stat.mean, stat.median));
+  }
+
+  // --- évolution de la consistance intra-test (si mesurée) ---
+  const consistPts = history.filter((h) => typeof h.consistency === "number" && h.consistency! > 0);
+  if (consistPts.length >= 3) {
+    root.append(
+      progressionChart({
+        title: "Consistance intra-test",
+        subtitle: "écart-type du wpm entre les mots d'un même test (plus bas = plus régulier)",
+        points: consistPts.map((h) => ({
+          y: h.consistency as number,
+          category: h.mode,
+          label: `<span class="t-dim">${fmtDate(h.date)} · ${h.mode === "practice" ? "entraînement" : "normal"}</span>`,
+        })),
+        categories: progCats,
+        yFormat: (v) => "± " + fmt(v),
+        maWindow: win,
+      })
+    );
   }
 
   // --- vitesse vs précision ---
@@ -392,7 +483,7 @@ function renderProgression(
 //  Onglet Mots
 // ===========================================================================
 /** Variante « grand pool » de chaque famille — sert d'affichage sans exclure de mots. */
-const WIDE_VARIANT: Record<LangFamily, LangId> = { fr: "fr1k", en: "en1k" };
+const WIDE_VARIANT: Record<LangFamily, LangId> = { fr: "fr1k", en: "en1k", code: "code" };
 
 function renderWords(
   root: HTMLElement,
@@ -471,8 +562,48 @@ function renderWords(
     );
   }
 
+  // --- courbe d'apprentissage : wpm moyen au n-ième essai d'un mot ---
+  const curve = learningCurve(logs);
+  if (curve.some((c) => c.n > 0)) {
+    root.append(
+      barChart({
+        title: "Courbe d'apprentissage",
+        subtitle: "vitesse moyenne au n-ième essai chronométré d'un mot (tous mots confondus)",
+        items: curve
+          .map((c, i) => ({ c, i }))
+          .filter((x) => x.c.n > 0)
+          .map((x) => ({
+            label: x.i >= 10 ? "11+" : String(x.i + 1),
+            value: x.c.avg,
+            tint: ramp(0.3 + 0.7 * Math.min(1, x.i / 10), STATUS.good),
+            sub: `${fmt(x.c.n)} essais`,
+          })),
+        format: (v) => fmt(v) + " wpm",
+      })
+    );
+  }
+
   // --- tableau détaillé ---
   root.append(table.box);
+}
+
+/** wpm moyen au n-ième essai chronométré d'un mot (index 0..9, puis 10 = 11+). */
+function learningCurve(logs: TestLog[]): { avg: number; n: number }[] {
+  const sorted = [...logs].sort((a, b) => a.date - b.date);
+  const seen = new Map<string, number>();
+  const sum: number[] = new Array(11).fill(0);
+  const cnt: number[] = new Array(11).fill(0);
+  for (const t of sorted) {
+    for (const w of t.words) {
+      if (w.timeMs === null || w.timeMs <= 0) continue;
+      const occ = seen.get(w.text) ?? 0;
+      const k = Math.min(10, occ);
+      seen.set(w.text, occ + 1);
+      sum[k] = (sum[k] as number) + w.len / 5 / (w.timeMs / 60000);
+      cnt[k] = (cnt[k] as number) + 1;
+    }
+  }
+  return sum.map((s, i) => ({ avg: cnt[i]! > 0 ? s / cnt[i]! : 0, n: cnt[i]! }));
 }
 
 /**
@@ -612,7 +743,20 @@ function buildWordTimeline(
     hint.style.display = "none";
     host.innerHTML = "";
     const title = `Évolution de « ${word} »` + (multiFamily ? ` · ${FAMILY_LABEL[family]}` : "");
-    host.append(el("h3", "section-title", title));
+    const head = el("div", "timeline-head");
+    head.append(el("h3", "section-title", title));
+    const drillBtn = el("button", "btn", "⚑ Réviser ce mot");
+    drillBtn.title = "Ouvre un entraînement qui répète ce mot, de plus en plus espacé";
+    drillBtn.addEventListener(
+      "click",
+      () => {
+        sessionStorage.setItem("ft:drill", JSON.stringify({ lang: WIDE_VARIANT[family], word }));
+        location.hash = "#test";
+      },
+      { signal }
+    );
+    head.append(drillBtn);
+    host.append(head);
 
     if (trials.length < 2) {
       host.append(
@@ -1012,6 +1156,14 @@ type BiasWord = {
   lang: LangId;
   timeMs: number | null;
   errors: number;
+  startGapMs: number | undefined; // latence espace → 1re lettre
+  hour: number; // heure locale du test (0..23)
+  prevFaulted: boolean | null; // mot précédent fauté ? (null = 1er mot du test)
+  repeat: boolean; // mot déjà rencontré plus tôt dans CE test
+  novelty: number | null; // nb d'essais antérieurs du mot (toutes sessions), null si inconnu
+  sessionRank: number; // rang du test dans sa session (1 = premier)
+  line: boolean | undefined; // 1er mot d'une ligne visuelle
+  paceD: number | undefined; // avance(+)/retard(−) sur le fantôme
 };
 
 type Dimension = {
@@ -1064,6 +1216,67 @@ const BIAS_DIMS: Dimension[] = [
     buckets: ["normal", "entraînement"],
     of: (w) => (w.mode === "practice" ? "entraînement" : "normal"),
   },
+  {
+    key: "hour",
+    label: "Heure de la journée",
+    hint: "es-tu plus rapide le matin ou le soir ?",
+    buckets: ["matin", "après-midi", "soir", "nuit"],
+    of: (w) =>
+      w.hour < 5 ? "nuit" : w.hour < 12 ? "matin" : w.hour < 18 ? "après-midi" : w.hour < 24 ? "soir" : "nuit",
+  },
+  {
+    key: "prev",
+    label: "Mot précédent",
+    hint: "une faute au mot d'avant te déstabilise-t-elle ?",
+    buckets: ["après mot juste", "après mot fauté"],
+    of: (w) =>
+      w.prevFaulted === null ? null : w.prevFaulted ? "après mot fauté" : "après mot juste",
+  },
+  {
+    key: "repeat",
+    label: "Répétition dans le test",
+    hint: "un mot revu dans le même test est-il plus rapide ?",
+    buckets: ["1re occurrence", "déjà vu"],
+    of: (w) => (w.repeat ? "déjà vu" : "1re occurrence"),
+  },
+  {
+    key: "novelty",
+    label: "Nouveauté du mot",
+    hint: "courbe d'apprentissage : mots neufs vs bien connus",
+    buckets: ["jamais vu", "1–3 essais", "4–10 essais", "11+ essais"],
+    of: (w) =>
+      w.novelty === null
+        ? null
+        : w.novelty === 0
+        ? "jamais vu"
+        : w.novelty <= 3
+        ? "1–3 essais"
+        : w.novelty <= 10
+        ? "4–10 essais"
+        : "11+ essais",
+  },
+  {
+    key: "session",
+    label: "Rang dans la session",
+    hint: "échauffement au début, fatigue à la longue ?",
+    buckets: ["1–3", "4–10", "11+"],
+    of: (w) => (w.sessionRank <= 3 ? "1–3" : w.sessionRank <= 10 ? "4–10" : "11+"),
+  },
+  {
+    key: "line",
+    label: "Saut de ligne",
+    hint: "le retour du regard en début de ligne coûte-t-il ?",
+    buckets: ["début de ligne", "suite de ligne"],
+    of: (w) => (w.line === undefined ? null : w.line ? "début de ligne" : "suite de ligne"),
+  },
+  {
+    key: "ghost",
+    label: "Fantôme",
+    hint: "accélères-tu quand le curseur de rythme te dépasse ?",
+    buckets: ["devant le fantôme", "derrière le fantôme"],
+    of: (w) =>
+      w.paceD === undefined ? null : w.paceD >= 0 ? "devant le fantôme" : "derrière le fantôme",
+  },
 ];
 
 /** Dimension « Langue » : n'a de sens qu'avec plusieurs langues sélectionnées. */
@@ -1082,17 +1295,24 @@ type Bucket = {
   timedWords: number; // mots chronométrés (tapés en entier)
   timedChars: number;
   timedMs: number;
+  startGapSum: number; // somme des latences de départ (ms)
+  startGapN: number;
 };
 
 const bucketWpm = (b: Bucket): number | null =>
   b.timedMs > 0 ? b.timedChars / 5 / (b.timedMs / 60000) : null;
 const bucketErrRate = (b: Bucket): number =>
   b.words > 0 ? b.errWords / b.words : 0;
+const bucketStartGap = (b: Bucket): number | null =>
+  b.startGapN > 0 ? b.startGapSum / b.startGapN : null;
 
 function computeBuckets(words: BiasWord[], dim: Dimension): Bucket[] {
   const map = new Map<string, Bucket>();
   for (const label of dim.buckets) {
-    map.set(label, { label, words: 0, errWords: 0, timedWords: 0, timedChars: 0, timedMs: 0 });
+    map.set(label, {
+      label, words: 0, errWords: 0, timedWords: 0, timedChars: 0, timedMs: 0,
+      startGapSum: 0, startGapN: 0,
+    });
   }
   for (const w of words) {
     const label = dim.of(w);
@@ -1106,13 +1326,31 @@ function computeBuckets(words: BiasWord[], dim: Dimension): Bucket[] {
       b.timedChars += w.len;
       b.timedMs += w.timeMs;
     }
+    if (w.startGapMs !== undefined && w.startGapMs > 0) {
+      b.startGapSum += w.startGapMs;
+      b.startGapN += 1;
+    }
   }
   return dim.buckets.map((l) => map.get(l)!).filter((b) => b.words > 0);
 }
 
+const SESSION_GAP_MS = 30 * 60 * 1000; // > 30 min entre deux tests → nouvelle session
+
 function renderBias(root: HTMLElement, logs: TestLog[], showLang: boolean, signal: AbortSignal): void {
+  // ordre chronologique : nécessaire pour la nouveauté (essais antérieurs) et le
+  // rang de session, qui dépendent de l'histoire cumulée.
+  const sorted = [...logs].sort((a, b) => a.date - b.date);
+  const seenGlobal = new Map<string, number>(); // essais antérieurs d'un mot (toutes sessions)
+  let sessionRank = 0;
+  let lastDate = -Infinity;
+
   const words: BiasWord[] = [];
-  for (const t of logs) {
+  for (const t of sorted) {
+    sessionRank = t.date - lastDate > SESSION_GAP_MS ? 1 : sessionRank + 1;
+    lastDate = t.date;
+    const hour = new Date(t.date).getHours();
+    const seenInTest = new Set<string>();
+    let prevFaulted: boolean | null = null;
     for (const w of t.words) {
       words.push({
         len: w.len,
@@ -1124,7 +1362,18 @@ function renderBias(root: HTMLElement, logs: TestLog[], showLang: boolean, signa
         lang: t.lang,
         timeMs: w.timeMs,
         errors: w.errors,
+        startGapMs: w.startGapMs,
+        hour,
+        prevFaulted,
+        repeat: seenInTest.has(w.text),
+        novelty: seenGlobal.get(w.text) ?? 0,
+        sessionRank,
+        line: w.line,
+        paceD: t.pace ? w.paceD : undefined,
       });
+      seenInTest.add(w.text);
+      seenGlobal.set(w.text, (seenGlobal.get(w.text) ?? 0) + 1);
+      prevFaulted = w.errors > 0;
     }
   }
   const dims = showLang ? [LANG_DIM, ...BIAS_DIMS] : BIAS_DIMS;
@@ -1205,6 +1454,26 @@ function renderBias(root: HTMLElement, logs: TestLog[], showLang: boolean, signa
     );
     charts.append(cols);
 
+    // --- latence de départ de mot (espace → 1re lettre) si mesurée ---
+    if (buckets.some((b) => bucketStartGap(b) !== null)) {
+      charts.append(
+        barChart({
+          title: "Latence de départ de mot",
+          subtitle: "délai entre l'espace et la 1re lettre — lecture/anticipation",
+          items: buckets.map((b) => {
+            const g = bucketStartGap(b);
+            return {
+              label: b.label,
+              value: g ?? 0,
+              tint: g === null ? STATUS.warning : PACE,
+              sub: g === null ? "non mesuré" : `${fmt(b.startGapN)} départs`,
+            };
+          }),
+          format: (v) => fmt(v) + " ms",
+        })
+      );
+    }
+
     // --- lecture rapide : extrêmes ---
     const timed = buckets.filter((b) => bucketWpm(b) !== null);
     const note = el("div", "empty-note");
@@ -1260,16 +1529,16 @@ function renderBigrams(root: HTMLElement, bigrams: Record<string, BigramStat>): 
     return;
   }
 
-  // sélection par défaut : l'espace + les caractères les plus fréquents
-  const DEFAULT_MAX = 15;
-  const selected = new Set<string>(
-    [...weight.entries()]
-      .filter(([ch]) => ch !== " ")
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, DEFAULT_MAX)
-      .map(([ch]) => ch)
-  );
-  selected.add(" "); // espace inclus par défaut (chip pour l'enlever)
+  // catégories de caractères, utilisées pour la sélection par défaut et les
+  // boutons de raccourci ci-dessous
+  const isDigit = (ch: string) => ch >= "0" && ch <= "9";
+  const isPlainLetter = (ch: string) => /^[a-zA-Z]$/.test(ch);
+  const isAccent = (ch: string) => ch !== " " && !isDigit(ch) && !isPlainLetter(ch) && /\p{L}/u.test(ch);
+  const isPunct = (ch: string) => ch !== " " && !isDigit(ch) && !isPlainLetter(ch) && !isAccent(ch);
+
+  // sélection par défaut : seulement les lettres simples (hors accents,
+  // chiffres, ponctuation et espace)
+  const selected = new Set<string>(allChars.filter(isPlainLetter));
 
   // --- sélecteur de caractères (chips interactifs) ---
   const selBar = el("div", "char-select");
@@ -1288,18 +1557,54 @@ function renderBigrams(root: HTMLElement, bigrams: Record<string, BigramStat>): 
     chipEls.set(ch, chip);
     chipsWrap.append(chip);
   }
+  const presetBtns: [HTMLButtonElement, (ch: string) => boolean][] = [];
+  const refreshChips = () => {
+    for (const [ch, chip] of chipEls) chip.classList.toggle("on", selected.has(ch));
+    for (const [btn, pred] of presetBtns) {
+      const chars = allChars.filter(pred);
+      btn.classList.toggle("on", chars.length > 0 && chars.every((ch) => selected.has(ch)));
+    }
+    build();
+  };
+  // Tout / Aucun : remplacent la sélection entière.
   const setAll = (on: boolean) => {
     selected.clear();
     if (on) for (const ch of allChars) selected.add(ch);
-    for (const [ch, chip] of chipEls) chip.classList.toggle("on", selected.has(ch));
-    build();
+    refreshChips();
+  };
+  // catégories (Lettres, Accents…) : bascule cumulative — ajoute la catégorie
+  // à la sélection courante, ou la retire si elle est déjà entièrement sélectionnée,
+  // pour pouvoir combiner plusieurs catégories à la fois.
+  const toggleBy = (pred: (ch: string) => boolean) => {
+    const chars = allChars.filter(pred);
+    const allOn = chars.length > 0 && chars.every((ch) => selected.has(ch));
+    for (const ch of chars) {
+      if (allOn) selected.delete(ch);
+      else selected.add(ch);
+    }
+    refreshChips();
   };
   const actions = el("div", "char-actions");
   const bAll = el("button", "seg-btn", "Tout");
   bAll.addEventListener("click", () => setAll(true));
   const bNone = el("button", "seg-btn", "Aucun");
   bNone.addEventListener("click", () => setAll(false));
-  actions.append(bAll, bNone);
+  const presets: [string, (ch: string) => boolean][] = [
+    ["Lettres", isPlainLetter],
+    ["Accents", isAccent],
+    ["Chiffres", isDigit],
+    ["Ponctuation", isPunct],
+  ];
+  actions.append(bAll);
+  for (const [label, pred] of presets) {
+    const chars = allChars.filter(pred);
+    const on = chars.length > 0 && chars.every((ch) => selected.has(ch));
+    const b = el("button", "seg-btn" + (on ? " on" : ""), label);
+    b.addEventListener("click", () => toggleBy(pred));
+    presetBtns.push([b, pred]);
+    actions.append(b);
+  }
+  actions.append(bNone);
   selBar.append(chipsWrap, actions);
   root.append(selBar);
 
@@ -1490,6 +1795,351 @@ function renderBigrams(root: HTMLElement, bigrams: Record<string, BigramStat>): 
   }
 
   build();
+}
+
+// ===========================================================================
+//  Onglet Clavier — heatmap AZERTY, caractères spéciaux, doublées, erreurs
+// ===========================================================================
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+// disposition AZERTY : rangées de lettres + une rangée d'accents directs
+const KB_ROWS: string[][] = [
+  ["é", "è", "à", "ç", "ù"],
+  ["a", "z", "e", "r", "t", "y", "u", "i", "o", "p"],
+  ["q", "s", "d", "f", "g", "h", "j", "k", "l", "m"],
+  ["w", "x", "c", "v", "b", "n"],
+];
+const KB_ROW_OFFSET = [3.2, 0, 0.4, 1.0]; // décalage horizontal (en touches) par rangée
+
+/** Métrique entrante par lettre : agrège tous les bigrammes « ?lettre ». */
+function incomingByLetter(
+  bigrams: Record<string, BigramStat>
+): Map<string, { gap: number; gapN: number; err: number; tot: number }> {
+  const m = new Map<string, { gap: number; gapN: number; err: number; tot: number }>();
+  for (const [k, b] of Object.entries(bigrams)) {
+    if (k.length !== 2) continue;
+    const c = k[1] as string;
+    const cur = m.get(c) ?? { gap: 0, gapN: 0, err: 0, tot: 0 };
+    cur.gap += b.gapMs;
+    cur.gapN += b.count;
+    cur.err += b.errors;
+    cur.tot += b.count + b.errors;
+    m.set(c, cur);
+  }
+  return m;
+}
+
+function renderKeyboard(
+  root: HTMLElement,
+  bigrams: Record<string, BigramStat>,
+  logs: TestLog[],
+  signal: AbortSignal
+): void {
+  if (Object.keys(bigrams).length === 0) {
+    root.append(el("div", "empty-note", "Aucune donnée de frappe — fais quelques tests !"));
+    return;
+  }
+
+  const incoming = incomingByLetter(bigrams);
+  let metric: "gap" | "error" = "gap";
+  let showArrows = true;
+
+  root.append(el("h3", "section-title", "Clavier AZERTY"));
+  root.append(
+    el("div", "empty-note", "Chaque touche est colorée selon les transitions qui y arrivent (délai ou taux d'erreur). Les flèches relient tes pires bigrammes.")
+  );
+
+  // contrôles : métrique + flèches
+  const controls = el("div", "carto-controls");
+  const metricSeg = segToggle(
+    [{ key: "gap", label: "Délai" }, { key: "error", label: "Erreurs" }],
+    metric,
+    (k) => { metric = k as typeof metric; draw(); },
+    signal
+  );
+  const arrowsBtn = el("button", "seg-btn on", "Flèches bigrammes");
+  arrowsBtn.addEventListener("click", () => {
+    showArrows = !showArrows;
+    arrowsBtn.classList.toggle("on", showArrows);
+    draw();
+  }, { signal });
+  controls.append(labeled("Métrique", metricSeg), labeled("Repères", arrowsBtn));
+  root.append(controls);
+
+  const host = el("div", "carto-host");
+  root.append(host);
+
+  // valeur normalisée d'une touche (0 = bon, 1 = mauvais) selon la métrique
+  function keyValue(c: string): number | null {
+    const d = incoming.get(c);
+    if (!d) return null;
+    if (metric === "gap") return d.gapN >= 3 ? d.gap / d.gapN : null;
+    return d.tot >= 3 ? d.err / d.tot : null;
+  }
+
+  function draw(): void {
+    host.innerHTML = "";
+    // amplitude pour normaliser les couleurs
+    const vals: number[] = [];
+    for (const row of KB_ROWS) for (const c of row) {
+      const v = keyValue(c);
+      if (v !== null) vals.push(v);
+    }
+    const lo = vals.length ? Math.min(...vals) : 0;
+    const hi = vals.length ? Math.max(...vals) : 1;
+    const norm = (v: number) => (hi > lo ? (v - lo) / (hi - lo) : 0.5);
+    const hue = metric === "gap" ? STATUS.serious : STATUS.critical;
+
+    const KW = 44, KH = 44, GAP = 6;
+    const cols = 10;
+    const width = cols * (KW + GAP) + 40;
+    const height = KB_ROWS.length * (KH + GAP) + 10;
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.style.width = "100%";
+    svg.style.maxWidth = width + "px";
+    svg.style.display = "block";
+
+    const pos = new Map<string, { cx: number; cy: number }>();
+    KB_ROWS.forEach((rowChars, r) => {
+      const xoff = (KB_ROW_OFFSET[r] ?? 0) * (KW + GAP) + 20;
+      const y = r * (KH + GAP) + 5;
+      rowChars.forEach((c, i) => {
+        const x = xoff + i * (KW + GAP);
+        pos.set(c, { cx: x + KW / 2, cy: y + KH / 2 });
+        const v = keyValue(c);
+        const rect = document.createElementNS(SVG_NS, "rect");
+        rect.setAttribute("x", String(x));
+        rect.setAttribute("y", String(y));
+        rect.setAttribute("width", String(KW));
+        rect.setAttribute("height", String(KH));
+        rect.setAttribute("rx", "6");
+        rect.setAttribute("fill", v === null ? "#221d12" : ramp(0.25 + 0.75 * norm(v), hue));
+        rect.setAttribute("stroke", "#3a3320");
+        const d = incoming.get(c);
+        const titleEl = document.createElementNS(SVG_NS, "title");
+        titleEl.textContent =
+          v === null
+            ? `${c} — pas assez de données`
+            : metric === "gap"
+            ? `${c} — ${fmt(v)} ms en moyenne pour l'atteindre (${d?.gapN ?? 0} transitions)`
+            : `${c} — ${fmtPct(v)} d'erreur en arrivant (${d?.err ?? 0} / ${d?.tot ?? 0})`;
+        rect.append(titleEl);
+        svg.append(rect);
+        const label = document.createElementNS(SVG_NS, "text");
+        label.setAttribute("x", String(x + KW / 2));
+        label.setAttribute("y", String(y + KH / 2 + 5));
+        label.setAttribute("text-anchor", "middle");
+        label.setAttribute("font-size", "16");
+        label.setAttribute("fill", "#f2e6c4");
+        label.setAttribute("pointer-events", "none");
+        label.textContent = c;
+        svg.append(label);
+      });
+    });
+
+    // flèches des pires bigrammes (paires de lettres présentes sur le clavier)
+    if (showArrows) {
+      const marker = document.createElementNS(SVG_NS, "marker");
+      marker.setAttribute("id", "kb-arrow");
+      marker.setAttribute("viewBox", "0 0 8 8");
+      marker.setAttribute("refX", "6");
+      marker.setAttribute("refY", "4");
+      marker.setAttribute("markerWidth", "5");
+      marker.setAttribute("markerHeight", "5");
+      marker.setAttribute("orient", "auto-start-reverse");
+      const tri = document.createElementNS(SVG_NS, "path");
+      tri.setAttribute("d", "M0,0 L8,4 L0,8 z");
+      tri.setAttribute("fill", ACCENT);
+      marker.append(tri);
+      const defs = document.createElementNS(SVG_NS, "defs");
+      defs.append(marker);
+      svg.append(defs);
+
+      const worst = Object.entries(bigrams)
+        .filter(([k]) => k.length === 2 && pos.has(k[0]!) && pos.has(k[1]!) && k[0] !== k[1])
+        .map(([k, b]) => ({ k, score: bigramScore(b, metric) }))
+        .filter((d) => d.score !== null)
+        .sort((a, b) => (b.score as number) - (a.score as number))
+        .slice(0, 5);
+      for (const { k } of worst) {
+        const p1 = pos.get(k[0]!)!;
+        const p2 = pos.get(k[1]!)!;
+        const line = document.createElementNS(SVG_NS, "line");
+        line.setAttribute("x1", String(p1.cx));
+        line.setAttribute("y1", String(p1.cy));
+        line.setAttribute("x2", String(p2.cx));
+        line.setAttribute("y2", String(p2.cy));
+        line.setAttribute("stroke", ACCENT);
+        line.setAttribute("stroke-width", "2");
+        line.setAttribute("opacity", "0.45");
+        line.setAttribute("marker-end", "url(#kb-arrow)");
+        svg.append(line);
+      }
+    }
+    host.append(svg);
+  }
+  draw();
+
+  // --- coût des caractères spéciaux (accents) ---
+  renderSpecialCost(root, incoming);
+
+  // --- lettres doublées ---
+  renderDoubledLetters(root, bigrams);
+
+  // --- typologie des erreurs & micro-frappe ---
+  renderErrorProfile(root, logs);
+}
+
+/** Score de difficulté d'un bigramme selon la métrique affichée. */
+function bigramScore(b: BigramStat, metric: "gap" | "error"): number | null {
+  if (metric === "gap") return b.count >= 3 ? b.gapMs / b.count : null;
+  const tot = b.count + b.errors;
+  return tot >= 3 ? b.errors / tot : null;
+}
+
+const ACCENTED = ["é", "è", "ê", "à", "â", "ç", "ù", "û", "î", "ô", "ë", "ï"];
+
+/** Coût des caractères accentués : délai et taux d'erreur vs lettres simples. */
+function renderSpecialCost(
+  root: HTMLElement,
+  incoming: Map<string, { gap: number; gapN: number; err: number; tot: number }>
+): void {
+  const rows = ACCENTED.map((c) => ({ c, d: incoming.get(c) }))
+    .filter((x) => x.d && x.d.gapN >= 3) as { c: string; d: { gap: number; gapN: number; err: number; tot: number } }[];
+  if (rows.length === 0) return;
+  // repère : délai moyen des lettres simples (a–z)
+  let simpleGap = 0, simpleN = 0;
+  for (const [c, d] of incoming) {
+    if (/^[a-z]$/.test(c)) { simpleGap += d.gap; simpleN += d.gapN; }
+  }
+  const baseline = simpleN > 0 ? simpleGap / simpleN : 0;
+  root.append(el("h3", "section-title", "Coût des caractères accentués"));
+  root.append(
+    el("div", "empty-note", `Délai moyen pour atteindre chaque accent. Repère : ${fmt(baseline)} ms pour une lettre simple.`)
+  );
+  root.append(
+    barChart({
+      title: "Délai d'accès (ms)",
+      subtitle: "touches mortes / AltGr vs lettres simples",
+      items: rows
+        .map((x) => ({ c: x.c, gap: x.d.gap / x.d.gapN }))
+        .sort((a, b) => b.gap - a.gap)
+        .map((x) => ({
+          label: x.c,
+          value: x.gap,
+          mono: true,
+          tint: x.gap > baseline ? STATUS.serious : STATUS.good,
+          sub: x.gap > baseline ? `+${fmt(x.gap - baseline)} ms` : "sous la moyenne",
+        })),
+      format: (v) => fmt(v) + " ms",
+    })
+  );
+}
+
+/** Lettres doublées (ll, ss, tt…) : délai et fautes, souvent un angle mort. */
+function renderDoubledLetters(root: HTMLElement, bigrams: Record<string, BigramStat>): void {
+  const doubles = Object.entries(bigrams)
+    .filter(([k]) => k.length === 2 && k[0] === k[1] && /[a-zà-ÿ]/i.test(k[0]!))
+    .map(([k, b]) => ({
+      k,
+      gap: b.count >= 3 ? b.gapMs / b.count : null,
+      rate: b.count + b.errors >= 3 ? b.errors / (b.count + b.errors) : null,
+      count: b.count,
+    }))
+    .filter((d) => d.gap !== null || d.rate !== null);
+  if (doubles.length === 0) return;
+  root.append(el("h3", "section-title", "Lettres doublées"));
+  root.append(
+    el("div", "empty-note", "Frappe deux fois la même touche (ll, ss, mm…) — un même doigt qui répète, souvent invisible ailleurs.")
+  );
+  const cols = el("div", "two-cols");
+  cols.append(
+    barChart({
+      title: "Délai (ms)",
+      items: doubles
+        .filter((d) => d.gap !== null)
+        .sort((a, b) => (b.gap as number) - (a.gap as number))
+        .slice(0, 12)
+        .map((d) => ({ label: d.k, value: d.gap as number, mono: true, tint: STATUS.serious, sub: `${d.count} fois` })),
+      format: (v) => fmt(v) + " ms",
+    }),
+    barChart({
+      title: "Taux d'erreur",
+      items: doubles
+        .filter((d) => d.rate !== null && (d.rate as number) > 0)
+        .sort((a, b) => (b.rate as number) - (a.rate as number))
+        .slice(0, 12)
+        .map((d) => ({ label: d.k, value: (d.rate as number) * 100, mono: true, tint: STATUS.critical })),
+      format: (v) => fmt(v, 1) + " %",
+    })
+  );
+  root.append(cols);
+}
+
+/** Typologie des fautes + micro-frappe, depuis les agrégats journalisés. */
+function renderErrorProfile(root: HTMLElement, logs: TestLog[]): void {
+  const withAgg = logs.filter((t) => t.agg);
+  if (withAgg.length === 0) {
+    root.append(
+      el("div", "empty-note", "Profil d'erreurs et micro-frappe : disponibles pour les tests joués depuis cette mise à jour.")
+    );
+    return;
+  }
+  let eSub = 0, eTrans = 0, eOmis = 0, eIns = 0;
+  let bksMs = 0, noticeSum = 0, noticeN = 0, hes = 0;
+  let dwellSum = 0, dwellN = 0, rollSum = 0, rollN = 0;
+  for (const t of withAgg) {
+    const a = t.agg!;
+    eSub += a.eSub; eTrans += a.eTrans; eOmis += a.eOmis; eIns += a.eIns;
+    bksMs += a.bksMs; hes += a.hes;
+    if (a.notice > 0) { noticeSum += a.notice; noticeN += 1; }
+    if (a.dwellAvg > 0) { dwellSum += a.dwellAvg; dwellN += 1; }
+    rollSum += a.roll; rollN += 1;
+  }
+  const totalErr = eSub + eTrans + eOmis + eIns;
+
+  root.append(el("h3", "section-title", "Profil des erreurs"));
+  if (totalErr > 0) {
+    root.append(
+      barChart({
+        title: "Type de faute",
+        subtitle: "chaque faute rangée par nature",
+        items: [
+          { label: "substitution", value: eSub, tint: STATUS.critical, sub: "mauvaise lettre" },
+          { label: "transposition", value: eTrans, tint: STATUS.serious, sub: "lettres interverties" },
+          { label: "omission", value: eOmis, tint: STATUS.warning, sub: "lettre sautée" },
+          { label: "insertion", value: eIns, tint: PACE, sub: "lettre en trop" },
+        ],
+        format: (v) => fmt(v),
+      })
+    );
+  }
+
+  // --- tuiles micro-frappe ---
+  root.append(el("h3", "section-title", "Micro-frappe & correction"));
+  const cards = el("div", "cards-row");
+  const mk = (label: string, value: string, hint?: string) => {
+    const tile = el("div", "tile");
+    tile.append(el("div", "label", label), el("div", "value", value));
+    if (hint) tile.append(el("div", "tile-hint", hint));
+    return tile;
+  };
+  cards.append(
+    mk("correction / test", fmt(bksMs / withAgg.length / 1000, 1) + " s", "temps en retour arrière"),
+    mk("hésitations / test", fmt(hes / withAgg.length, 1), "pauses > 2× ta cadence"),
+    mk("détection", noticeN > 0 ? fmt(noticeSum / noticeN, 1) : "—", "lettres avant de voir la faute")
+  );
+  if (dwellN > 0) {
+    cards.append(mk("appui touche", fmt(dwellSum / dwellN) + " ms", "durée moyenne"));
+  }
+  if (rollN > 0) {
+    cards.append(mk("chevauchement", fmtPct(rollSum / rollN), "frappes qui se recouvrent"));
+  }
+  root.append(cards);
+  root.append(
+    el("div", "empty-note", "Le chevauchement (rollover) monte avec la vitesse : les frappeurs rapides commencent la touche suivante avant d'avoir relâché la précédente.")
+  );
 }
 
 // ===========================================================================

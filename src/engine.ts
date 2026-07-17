@@ -2,6 +2,7 @@ import type {
   BigramStat,
   Keystroke,
   LangId,
+  TestAgg,
   TestMode,
   TestResult,
   TestWord,
@@ -11,8 +12,35 @@ import type {
 
 const MAX_EXTRA = 8; // caractères en trop autorisés par mot
 const BIGRAM_MAX_GAP = 2000; // au-delà, on considère une pause, pas une transition
+const HES_MIN_MS = 300; // en-deçà, un gap n'est pas une vraie hésitation
+/** Au-delà, on considère que l'utilisateur s'est arrêté (parti, distrait) : le
+ * test est faussé et sera écarté des stats. */
+export const IDLE_ABANDON_MS = 10000;
 
 export type EngineEvent = "update" | "finish" | "ignore";
+
+/** Mot fourni au moteur : simple texte, ou texte à taper + mot nu (clé des stats). */
+export type WordInput = string | { text: string; base: string };
+
+function toWord(input: WordInput): TestWord {
+  const text = typeof input === "string" ? input : input.text;
+  const base = typeof input === "string" ? undefined : input.base;
+  return { text, base, typed: "", states: [], errors: 0, posWrong: [], bks: 0 };
+}
+
+function median(xs: number[]): number {
+  if (xs.length === 0) return 0;
+  const s = [...xs].sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 ? (s[m] as number) : ((s[m - 1] as number) + (s[m] as number)) / 2;
+}
+
+function stddev(xs: number[]): number {
+  if (xs.length === 0) return 0;
+  const mean = xs.reduce((a, b) => a + b, 0) / xs.length;
+  const v = xs.reduce((a, b) => a + (b - mean) ** 2, 0) / xs.length;
+  return Math.sqrt(v);
+}
 
 export class TestEngine {
   readonly words: TestWord[];
@@ -21,21 +49,36 @@ export class TestEngine {
   finishedAt: number | null = null;
   keystrokes: Keystroke[] = [];
   bigrams = new Map<string, BigramStat>();
+  /** Plus long temps d'inactivité (ms) entre deux actions au clavier pendant le
+   * test : au-delà de {@link IDLE_ABANDON_MS}, le test est réputé abandonné. */
+  maxIdleMs = 0;
+  private lastActMs: number | null = null; // dernière action clavier (frappe, espace, retour arrière)
   private lastKeyMs: number | null = null; // dernière frappe correcte dans le mot courant
 
   readonly lang: LangId;
   readonly mode: TestMode;
 
-  constructor(wordTexts: string[], lang: LangId, mode: TestMode) {
+  // --- collecte fine (agrégats par test) ---
+  private errorTs: number[] = []; // instants (s) des frappes fausses
+  private eSub = 0;
+  private eTrans = 0;
+  private eOmis = 0;
+  private eIns = 0;
+  private bksMs = 0; // temps cumulé passé en retour arrière
+  private bksRunStart: number | null = null; // début du run de retour arrière courant
+  private firstBadPos: number | null = null; // position de la 1re faute non corrigée du mot
+  private noticeSum = 0;
+  private noticeN = 0;
+
+  constructor(words: WordInput[], lang: LangId, mode: TestMode) {
     this.lang = lang;
     this.mode = mode;
-    this.words = wordTexts.map((text) => ({
-      text,
-      typed: "",
-      states: [],
-      errors: 0,
-      posWrong: [],
-    }));
+    this.words = words.map(toWord);
+  }
+
+  /** Ajoute des mots en fin de liste (flux infini du mode durée). */
+  appendWords(inputs: WordInput[]): void {
+    for (const inp of inputs) this.words.push(toWord(inp));
   }
 
   get finished(): boolean {
@@ -53,44 +96,110 @@ export class TestEngine {
     return this.words.length > 0 ? this.index / this.words.length : 0;
   }
 
+  /** true si une pause d'au moins {@link IDLE_ABANDON_MS} a eu lieu (test faussé). */
+  get abandonedByPause(): boolean {
+    return this.maxIdleMs >= IDLE_ABANDON_MS;
+  }
+
+  /**
+   * Note l'instant d'une action clavier et met à jour {@link maxIdleMs}. Ignoré
+   * tant que le test n'a pas démarré (l'attente avant la 1re frappe n'est pas une
+   * pause). Chaque frappe, espace et retour arrière effectifs l'appellent.
+   */
+  private mark(now: number): void {
+    if (this.startedAt === null) return;
+    if (this.lastActMs !== null) {
+      const gap = now - this.lastActMs;
+      if (gap > this.maxIdleMs) this.maxIdleMs = gap;
+    }
+    this.lastActMs = now;
+  }
+
+  /** Ferme un éventuel run de retour arrière en cours (comptabilise son temps). */
+  private closeBksRun(now: number): void {
+    if (this.bksRunStart !== null) {
+      this.bksMs += now - this.bksRunStart;
+      this.bksRunStart = null;
+    }
+  }
+
   typeChar(ch: string, now: number): EngineEvent {
     if (this.finished) return "ignore";
     if (ch === " ") return this.space(now);
     if (ch.length !== 1 || ch === "\n" || ch === "\t") return "ignore";
 
     if (this.startedAt === null) this.startedAt = now;
+    this.mark(now);
+    this.closeBksRun(now);
     const word = this.current;
     if (word.startMs === undefined) word.startMs = now;
 
     const pos = word.typed.length;
     if (pos >= word.text.length + MAX_EXTRA) return "ignore";
 
+    // latence de départ de mot : délai espace → première lettre
+    if (pos === 0 && this.lastKeyMs !== null && word.startGapMs === undefined) {
+      const gap = now - this.lastKeyMs;
+      if (gap > 0 && gap <= BIGRAM_MAX_GAP) word.startGapMs = gap;
+    }
+
     let correct: boolean;
     if (pos < word.text.length) {
       const expected = word.text[pos] as string;
       correct = ch === expected;
       word.states[pos] = correct ? "correct" : "incorrect";
-      if (!correct) word.posWrong[pos] = true;
+      if (!correct) {
+        word.posWrong[pos] = true;
+        this.classifyError(word, pos, ch);
+        if (this.firstBadPos === null) this.firstBadPos = pos;
+      }
       this.recordBigram(word, pos, correct, now);
     } else {
       correct = false;
       word.states[pos] = "extra";
+      this.eIns += 1;
+      if (this.firstBadPos === null) this.firstBadPos = pos;
     }
-    if (!correct) word.errors += 1;
+    if (!correct) {
+      word.errors += 1;
+      this.errorTs.push((now - this.startedAt) / 1000);
+    }
     word.typed += ch;
     this.keystrokes.push({ t: now - this.startedAt, correct });
     this.lastKeyMs = correct ? now : null;
 
     // dernier mot tapé en entier → fin du test
-    if (
-      this.index === this.words.length - 1 &&
-      word.typed === word.text
-    ) {
+    if (this.index === this.words.length - 1 && word.typed === word.text) {
       word.endMs = now;
       this.finishedAt = now;
       return "finish";
     }
     return "update";
+  }
+
+  /**
+   * Classe une frappe fausse (à l'intérieur du mot) : transposition (deux lettres
+   * voisines interverties), omission (on a tapé la lettre suivante en sautant
+   * celle attendue), sinon substitution. Heuristiques en ligne, forcément
+   * imparfaites, mais suffisantes pour un profil d'erreurs agrégé.
+   */
+  private classifyError(word: TestWord, pos: number, ch: string): void {
+    const text = word.text;
+    if (
+      pos > 0 &&
+      word.states[pos - 1] === "incorrect" &&
+      word.typed[pos - 1] === text[pos] &&
+      ch === text[pos - 1]
+    ) {
+      this.eTrans += 1;
+      this.eSub = Math.max(0, this.eSub - 1); // la 1re lettre avait été comptée en substitution
+      return;
+    }
+    if (pos + 1 < text.length && ch === text[pos + 1]) {
+      this.eOmis += 1;
+      return;
+    }
+    this.eSub += 1;
   }
 
   private recordBigram(
@@ -126,6 +235,8 @@ export class TestEngine {
 
   private space(now: number): EngineEvent {
     if (this.finished || this.startedAt === null) return "ignore";
+    this.mark(now);
+    this.closeBksRun(now);
     const word = this.current;
     if (word.typed.length === 0) return "ignore";
 
@@ -149,6 +260,7 @@ export class TestEngine {
     // on garde l'instant de l'espace comme référence pour chronométrer la
     // première frappe du mot suivant (bigramme « espace → lettre »)
     this.lastKeyMs = now;
+    this.firstBadPos = null; // nouveau mot : plus de faute « en attente »
     this.index += 1;
     if (this.index >= this.words.length) {
       this.finishedAt = now;
@@ -157,9 +269,19 @@ export class TestEngine {
     return "update";
   }
 
-  backspace(): EngineEvent {
+  backspace(now: number): EngineEvent {
     if (this.finished) return "ignore";
+    this.mark(now);
     const word = this.current;
+    // ouvre (ou prolonge) un run de retour arrière, et note la distance de
+    // détection : combien de lettres tapées après la 1re faute avant de revenir
+    if (this.bksRunStart === null) {
+      this.bksRunStart = now;
+      if (this.firstBadPos !== null && word.typed.length > 0) {
+        this.noticeSum += Math.max(0, word.typed.length - 1 - this.firstBadPos);
+        this.noticeN += 1;
+      }
+    }
     if (word.typed.length === 0) {
       // retour sur le mot précédent seulement s'il n'était pas parfait
       const prev = this.words[this.index - 1];
@@ -173,8 +295,19 @@ export class TestEngine {
     }
     word.typed = word.typed.slice(0, -1);
     word.states.pop();
+    word.bks += 1;
     this.lastKeyMs = null;
+    if (this.firstBadPos !== null && word.typed.length <= this.firstBadPos) {
+      this.firstBadPos = null; // on a effacé jusqu'à (ou avant) la faute
+    }
     return "update";
+  }
+
+  /** Termine le test à `now` (mode durée : le mot en cours reste incomplet). */
+  forceFinish(now: number): void {
+    if (this.finished || this.startedAt === null) return;
+    this.closeBksRun(now);
+    this.finishedAt = now;
   }
 
   result(): TestResult {
@@ -188,6 +321,8 @@ export class TestEngine {
     const wordResults: WordResult[] = [];
     for (let i = 0; i < this.words.length; i++) {
       const w = this.words[i] as TestWord;
+      if (w.typed.length === 0 && w.endMs === undefined) continue; // mot jamais atteint
+      const base = w.base ?? w.text;
       const complete = w.typed.length >= w.text.length;
       const correct = w.typed === w.text;
       if (correct) {
@@ -199,11 +334,11 @@ export class TestEngine {
           ? w.endMs - w.startMs
           : null;
       const posErrors: number[] = [];
-      for (let p = 0; p < w.text.length; p++) {
+      for (let p = 0; p < base.length; p++) {
         posErrors.push(w.posWrong[p] ? 1 : 0);
       }
       wordResults.push({
-        text: w.text,
+        text: base,
         timeMs,
         errors: w.errors + missed,
         correct,
@@ -225,6 +360,7 @@ export class TestEngine {
       accuracy: total > 0 ? correctKeys / total : 1,
       words: wordResults,
       wpmSeries: this.buildWpmSeries(durationMs),
+      errorTimes: [...this.errorTs],
     };
   }
 
@@ -242,6 +378,7 @@ export class TestEngine {
       const committed = w.endMs !== undefined;
       const reached = committed || w.typed.length > 0;
       if (!reached) continue;
+      const base = w.base ?? w.text;
       const complete = w.typed.length >= w.text.length;
       const missed = committed ? Math.max(0, w.text.length - w.typed.length) : 0;
       const timeMs =
@@ -249,15 +386,42 @@ export class TestEngine {
           ? (w.endMs as number) - w.startMs
           : null;
       out.push({
-        text: w.text,
+        text: base,
         index: i,
-        len: w.text.length,
+        len: base.length,
         timeMs,
         errors: w.errors + missed,
         correct: w.typed === w.text,
+        startGapMs: w.startGapMs,
+        line: w.line,
+        paceD: w.paceD,
+        bks: w.bks,
       });
     }
     return out;
+  }
+
+  /** Agrégats fins côté moteur (dwell/roll sont renseignés par la vue). */
+  aggregates(): TestAgg {
+    const ts = this.keystrokes.map((k) => k.t).sort((a, b) => a - b);
+    const gaps: number[] = [];
+    for (let i = 1; i < ts.length; i++) gaps.push((ts[i] as number) - (ts[i - 1] as number));
+    const gapMed = median(gaps);
+    const thresh = Math.max(HES_MIN_MS, gapMed * 2);
+    const hes = gaps.filter((g) => g > thresh).length;
+    return {
+      gapMed,
+      gapSd: stddev(gaps),
+      hes,
+      dwellAvg: 0,
+      roll: 0,
+      eSub: this.eSub,
+      eTrans: this.eTrans,
+      eOmis: this.eOmis,
+      eIns: this.eIns,
+      bksMs: this.bksMs,
+      notice: this.noticeN > 0 ? this.noticeSum / this.noticeN : 0,
+    };
   }
 
   /** WPM net cumulé, échantillonné à chaque seconde du test */

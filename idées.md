@@ -1,0 +1,2 @@
+# Idées d'améliorations — FastTyper
+

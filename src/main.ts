@@ -1,4 +1,6 @@
 import "./style.css";
+import { initDb } from "./db";
+import { initStore } from "./store";
 import { mountTestView } from "./ui/test-view";
 import { mountStatsView } from "./ui/stats-view";
 import { mountSettingsView } from "./ui/settings-view";
@@ -38,5 +40,17 @@ function render(): void {
   }
 }
 
-window.addEventListener("hashchange", render);
-render();
+initDb().then(() => {
+  initStore();
+  window.addEventListener("hashchange", render);
+  render();
+});
+
+// PWA : installe le service worker pour un fonctionnement hors-ligne
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch(() => {
+      // enregistrement impossible (contexte non sécurisé, etc.) : l'app reste en ligne
+    });
+  });
+}

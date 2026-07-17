@@ -93,9 +93,9 @@ body {
 }
 
 #app {
-  max-width: 960px;
+  max-width: 1400px;
   margin: 0 auto;
-  padding: 1.5rem 1rem 4rem 3.6rem;
+  padding: 1.5rem 2.5rem 4rem 5rem;
   position: relative;
   min-height: 100vh;
 }
@@ -107,7 +107,7 @@ body {
   position: absolute;
   top: 0;
   bottom: 0;
-  left: 1.1rem;
+  left: 2.5rem;
   width: 1.5px;
   background: var(--margin);
   pointer-events: none;
@@ -540,7 +540,31 @@ kbd {
     0 2px 16px var(--gold-glow);
 }
 .btn.primary:hover { box-shadow: 0 1px 0 rgba(255, 244, 200, 0.6) inset, 0 3px 22px var(--gold-glow); }
+.btn.danger { color: var(--text-2); }
 .btn.danger:hover { border-color: var(--status-critical); color: var(--status-critical); box-shadow: 0 0 14px rgba(201, 72, 47, 0.35); }
+.btn.danger.confirm {
+  border-color: var(--status-critical);
+  color: #fff;
+  background: linear-gradient(180deg, #d4573c, #b13a24);
+  font-weight: 700;
+}
+
+/* ---------- pop-up de suppression d'un test (graphe de progression) ---------- */
+.test-popover {
+  position: fixed;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.7rem 0.8rem;
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+}
+.test-popover .tp-head { font-weight: 700; color: var(--text); }
+.test-popover .tp-sub { font-size: 0.85rem; color: var(--text-2); }
+.test-popover .btn { width: 100%; }
 
 /* ---------- page stats ---------- */
 h2.page-title { font-size: 1.3rem; margin: 0 0 1.2rem; }
@@ -1004,4 +1028,87 @@ table.data tr.row-focus td {
   font-size: 0.9rem;
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
   z-index: 100;
+}
+
+/* ---------- mort subite : écran « raté » ---------- */
+.sudden-fail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 3rem 1rem;
+  text-align: center;
+}
+.sudden-fail .sf-title {
+  font-size: 2.4rem;
+  font-weight: 700;
+}
+.sudden-fail .sf-sub {
+  color: var(--text-2);
+  font-size: 1.05rem;
+}
+.sudden-fail .sf-wpm {
+  color: var(--muted);
+}
+.sudden-fail .btn {
+  margin-top: 1rem;
+}
+
+/* ---------- en-tête du panneau d'évolution d'un mot ---------- */
+.timeline-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+/* ---------- curseur lisse (option) ---------- */
+.live-caret {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--gold-bright);
+  box-shadow: 0 0 8px var(--gold-glow);
+  pointer-events: none;
+  z-index: 3;
+  transition: left 0.09s ease-out, top 0.09s ease-out;
+}
+.live-caret[hidden] { display: none; }
+/* en mode lisse, on masque le trait clignotant par lettre */
+.words.smooth-caret .letter.caret::before,
+.words.smooth-caret .letter.caret-end::after {
+  display: none;
+}
+
+/* ---------- bannière « nouveau record » ---------- */
+.record-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  margin: 0.5rem 0 1rem;
+  padding: 0.5rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-weight: 700;
+  font-size: 1.1rem;
+  background: rgba(230, 193, 90, 0.08);
+  animation: record-pop 0.5s ease-out;
+}
+@keyframes record-pop {
+  0% { transform: scale(0.9); opacity: 0; }
+  60% { transform: scale(1.04); }
+  100% { transform: scale(1); opacity: 1; }
+}
+/* reflet doré qui balaie la tuile wpm quand un record tombe */
+.tile.record .value.gold-metal {
+  animation: record-shine 1.2s ease-in-out 1;
+}
+@keyframes record-shine {
+  0% { filter: brightness(1); }
+  50% { filter: brightness(1.5); }
+  100% { filter: brightness(1); }
 }

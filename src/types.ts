@@ -1,4 +1,7 @@
-export type LangId = "fr" | "fr1k" | "en" | "en1k";
+export type LangId = "fr" | "fr1k" | "fracc" | "en" | "en1k" | "code";
+
+/** Type de test : par nombre de mots ou par durée (chrono). */
+export type TestKind = "words" | "time";
 
 export type TestMode = "normal" | "practice";
 
@@ -6,13 +9,18 @@ export type LetterState = "correct" | "incorrect" | "extra";
 
 /** État d'un mot pendant le test */
 export type TestWord = {
-  text: string;
+  text: string; // caractères exacts à taper (peut inclure ponctuation/majuscule)
+  base?: string; // mot nu du dictionnaire, clé des stats (défaut : text)
   typed: string;
   states: LetterState[];
   errors: number; // frappes fausses (y compris extras) commises dans ce mot
   posWrong: boolean[]; // position p tapée fausse au moins une fois dans cet essai
+  bks: number; // retours arrière effectués dans ce mot
   startMs?: number;
   endMs?: number;
+  startGapMs?: number; // délai espace → première lettre du mot
+  line?: boolean; // premier mot d'une ligne visuelle (renseigné par la vue)
+  paceD?: number; // avance(+)/retard(−) en caractères sur le fantôme à la 1re frappe
 };
 
 export type Keystroke = { t: number; correct: boolean };
@@ -37,6 +45,7 @@ export type TestResult = {
   accuracy: number; // 0..1
   words: WordResult[];
   wpmSeries: { t: number; wpm: number }[];
+  errorTimes: number[]; // instants (s) des frappes fausses, pour marquer la courbe
 };
 
 /**
@@ -50,6 +59,25 @@ export type WordAttempt = {
   timeMs: number | null; // temps sur le mot (null si non tapé en entier)
   errors: number; // frappes fausses (+ caractères manqués si le mot a été validé)
   correct: boolean;
+  startGapMs?: number; // délai espace → première lettre (latence de départ)
+  line?: boolean; // premier mot d'une ligne visuelle
+  paceD?: number; // avance(+)/retard(−) en caractères sur le fantôme à la 1re frappe
+  bks?: number; // retours arrière dans ce mot
+};
+
+/** Agrégats fins d'un test, calculés à la fin et journalisés une fois par test. */
+export type TestAgg = {
+  gapMed: number; // médiane des délais inter-frappes (ms)
+  gapSd: number; // écart-type des délais inter-frappes
+  hes: number; // hésitations : gaps > 2× médiane et > 300 ms
+  dwellAvg: number; // durée d'appui moyenne des touches (ms), 0 si non mesuré
+  roll: number; // part de frappes en chevauchement / rollover (0..1)
+  eSub: number; // erreurs de substitution
+  eTrans: number; // transpositions (ab → ba)
+  eOmis: number; // omissions (lettre sautée)
+  eIns: number; // insertions (lettre en trop)
+  bksMs: number; // temps cumulé passé en retour arrière
+  notice: number; // lettres tapées en moyenne avant de remarquer une faute
 };
 
 /**
@@ -66,6 +94,8 @@ export type TestLog = {
   hints?: boolean; // surlignages/soulignages affichés pendant le test (optionnel : absent des anciens journaux)
   wordCount: number; // longueur voulue du test (10/25/50)
   completed: boolean; // true = test terminé, false = abandonné en cours
+  sudden?: boolean; // mode mort subite actif pendant ce test
+  agg?: TestAgg; // agrégats fins (absents des anciens journaux)
   words: WordAttempt[]; // uniquement les mots atteints
 };
 
@@ -96,11 +126,20 @@ export type HistoryEntry = {
   durationMs: number;
   wpm: number;
   accuracy: number;
+  kind?: TestKind; // "words" par défaut (absent des anciennes entrées)
+  target?: number; // nb de mots visé (words) ou secondes (time)
+  consistency?: number; // écart-type du wpm par mot au sein du test
 };
 
 export type Config = {
   lang: LangId;
   wordCount: number;
+  testKind: TestKind; // test par mots ou par durée
+  duration: number; // durée en secondes (mode "time")
+  punctuation: boolean; // saupoudrage de ponctuation/majuscules
+  sudden: boolean; // mort subite : une faute arrête le test
+  smoothCaret: boolean; // curseur glissant plutôt que par sauts
+  paceTarget: "median" | "record"; // cible du curseur de rythme
   colorBy: "off" | "speed" | "errors" | "both";
   hints: boolean; // interrupteur global des indices (surlignages/soulignages)
   minAttempts: number; // essais requis avant de colorer un mot
