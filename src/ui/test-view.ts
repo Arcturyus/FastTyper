@@ -276,7 +276,13 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     const count = targetCount();
     if (mode === "practice") {
       if (drillWord) {
-        return generateWordDrill(drillWord, count, LANGS[cfg.lang].words);
+        return generateWordDrill(
+          drillWord,
+          count,
+          LANGS[cfg.lang].words,
+          loadBigramStats(cfg.lang),
+          stats[drillWord]
+        );
       }
       if (forcedPool && forcedPool.length > 0) {
         const out: string[] = [];
@@ -341,6 +347,7 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
         timeMs: a.timeMs,
         errors: a.errors,
         correct: a.correct,
+        posErrors: a.posErrors,
         startGapMs: a.startGapMs,
         line: a.line,
         paceD: a.paceD,
@@ -712,7 +719,7 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     const meta = { lang: cfg.lang, mode, kind: cfg.testKind, target };
     // record calculé AVANT d'ajouter le test à l'historique (sinon il se bat lui-même)
     const newRecord = saveRecord(meta, result.wpm, result.date);
-    applyResult(result, engine.bigrams, {
+    applyResult(result, engine.bigrams, engine.confusions, {
       kind: cfg.testKind,
       target,
       consistency: testConsistency(result),
@@ -721,6 +728,7 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     // instantané pour une éventuelle suppression manuelle (l'engine sera remplacé
     // au prochain test) : on garde de quoi défaire exactement cet enregistrement.
     const savedBigrams = engine.bigrams;
+    const savedConfusions = engine.confusions;
     const savedLang = engine.lang;
     const revertMeta = { kind: cfg.testKind, target };
     let deleted = false;
@@ -746,7 +754,7 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
         onDelete: () => {
           if (deleted) return; // garde-fou : une seule suppression
           deleted = true;
-          revertResult(result, savedBigrams, revertMeta);
+          revertResult(result, savedBigrams, savedConfusions, revertMeta);
           removeTestLog(savedLang, result.date);
           toast("Test supprimé — retiré de tes statistiques.");
           forcedPool = null;
@@ -996,7 +1004,7 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
         saveConfig(cfg);
         mode = "practice";
         drillWord = word;
-        toast(`Révision du mot « ${word} »`);
+        toast(`Révision de « ${word} » : fragments de plus en plus longs, ciblés sur tes fautes`);
       }
     }
   } catch {

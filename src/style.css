@@ -874,6 +874,35 @@ table.data td .word-chip.clickable:hover { outline-color: var(--gold); }
 }
 .lang-pill.on::before { opacity: 1; box-shadow: 0 0 6px var(--lang-dot); }
 
+/* colonne de filtres de l'en-tête stats : Langues / Type / Modes + test actuel */
+.stats-filters {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.45rem;
+}
+.stats-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+.pill-sm {
+  padding: 0.14rem 0.55rem;
+  font-size: 0.74rem;
+}
+.pill-sm.lang-pill { gap: 0.3rem; }
+.pill-sm.lang-pill::before { width: 0.45rem; height: 0.45rem; }
+.current-test-btn {
+  color: var(--gold-bright);
+  border-color: var(--gold);
+}
+.current-test-btn:hover { box-shadow: 0 0 10px var(--gold-glow); }
+
+@media (max-width: 900px) {
+  .stats-filters { align-items: flex-start; }
+}
+
 /* cartographie interactive */
 .carto-block { margin-bottom: 1.2rem; }
 .carto-controls {
@@ -1061,6 +1090,12 @@ table.data tr.row-focus td {
   justify-content: space-between;
   gap: 1rem;
   flex-wrap: wrap;
+}
+/* bouton de révision répété sous chaque graphique du panneau (toujours visible
+   à proximité, quel que soit l'endroit où l'on a défilé) */
+.drill-btn {
+  display: block;
+  margin: -0.6rem 0 1.2rem;
 }
 
 /* ---------- curseur lisse (option) ---------- */

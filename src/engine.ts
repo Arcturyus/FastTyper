@@ -19,13 +19,21 @@ export const IDLE_ABANDON_MS = 10000;
 
 export type EngineEvent = "update" | "finish" | "ignore";
 
-/** Mot fourni au moteur : simple texte, ou texte à taper + mot nu (clé des stats). */
-export type WordInput = string | { text: string; base: string };
+/** Nature d'une frappe fausse à l'intérieur d'un mot (voir {@link TestEngine.classifyError}).
+ * Seuls "sub" et "omis" peuvent atteindre le journal des confusions (une confusion
+ * n'est enregistrée que si la 1re lettre du bigramme est correcte, or "trans" exige
+ * qu'elle soit fausse) ; "trans" n'apparaît donc que dans les agrégats globaux. */
+export type ErrKind = "sub" | "trans" | "omis";
+
+/** Mot fourni au moteur : simple texte, ou texte à taper + mot nu (clé des stats)
+ * + éventuel drapeau `noStats` (fragment d'exercice exclu des stats par mot). */
+export type WordInput = string | { text: string; base?: string; noStats?: boolean };
 
 function toWord(input: WordInput): TestWord {
   const text = typeof input === "string" ? input : input.text;
   const base = typeof input === "string" ? undefined : input.base;
-  return { text, base, typed: "", states: [], errors: 0, posWrong: [], bks: 0 };
+  const noStats = typeof input === "string" ? undefined : input.noStats;
+  return { text, base, noStats, typed: "", states: [], errors: 0, posWrong: [], bks: 0 };
 }
 
 function median(xs: number[]): number {
@@ -49,6 +57,12 @@ export class TestEngine {
   finishedAt: number | null = null;
   keystrokes: Keystroke[] = [];
   bigrams = new Map<string, BigramStat>();
+  /** Confusions : clé `${bigrammeAttendu}\t${lettreTapée}\t${type}` → nb de fois
+   * (type ∈ {@link ErrKind}, en pratique "sub" ou "omis"). Enregistrée exactement
+   * quand une erreur de bigramme l'est (2e lettre fausse, 1re correcte) : dit CE QUI
+   * a été tapé à la place, et la NATURE de la faute. Permet, au clic sur un bigramme,
+   * de détailler « tu voulais bs, tu as tapé bu (substitution) ». */
+  confusions = new Map<string, number>();
   /** Plus long temps d'inactivité (ms) entre deux actions au clavier pendant le
    * test : au-delà de {@link IDLE_ABANDON_MS}, le test est réputé abandonné. */
   maxIdleMs = 0;
@@ -148,12 +162,13 @@ export class TestEngine {
       const expected = word.text[pos] as string;
       correct = ch === expected;
       word.states[pos] = correct ? "correct" : "incorrect";
+      let errKind: ErrKind | null = null;
       if (!correct) {
         word.posWrong[pos] = true;
-        this.classifyError(word, pos, ch);
+        errKind = this.classifyError(word, pos, ch);
         if (this.firstBadPos === null) this.firstBadPos = pos;
       }
-      this.recordBigram(word, pos, correct, now);
+      this.recordBigram(word, pos, correct, now, ch, errKind);
     } else {
       correct = false;
       word.states[pos] = "extra";
@@ -183,7 +198,7 @@ export class TestEngine {
    * celle attendue), sinon substitution. Heuristiques en ligne, forcément
    * imparfaites, mais suffisantes pour un profil d'erreurs agrégé.
    */
-  private classifyError(word: TestWord, pos: number, ch: string): void {
+  private classifyError(word: TestWord, pos: number, ch: string): ErrKind {
     const text = word.text;
     if (
       pos > 0 &&
@@ -193,20 +208,23 @@ export class TestEngine {
     ) {
       this.eTrans += 1;
       this.eSub = Math.max(0, this.eSub - 1); // la 1re lettre avait été comptée en substitution
-      return;
+      return "trans";
     }
     if (pos + 1 < text.length && ch === text[pos + 1]) {
       this.eOmis += 1;
-      return;
+      return "omis";
     }
     this.eSub += 1;
+    return "sub";
   }
 
   private recordBigram(
     word: TestWord,
     pos: number,
     correct: boolean,
-    now: number
+    now: number,
+    typed: string,
+    errKind: ErrKind | null = null
   ): void {
     let key: string;
     if (pos === 0) {
@@ -229,6 +247,12 @@ export class TestEngine {
       }
     } else {
       b.errors += 1;
+      // confusion : bigramme attendu → lettre réellement tapée à la place, avec
+      // la nature de la faute (sub/omis — jamais trans ici, cf. ErrKind). La clé
+      // devient `${bigramme}\t${tapé}\t${type}` ; l'ancien format à 2 champs
+      // (avant cette mesure) reste lisible, son type valant « inconnu ».
+      const ck = `${key}\t${typed}\t${errKind ?? "sub"}`;
+      this.confusions.set(ck, (this.confusions.get(ck) ?? 0) + 1);
     }
     this.bigrams.set(key, b);
   }
@@ -328,6 +352,7 @@ export class TestEngine {
       if (correct) {
         correctChars += w.text.length + (i < this.words.length - 1 ? 1 : 0);
       }
+      if (w.noStats) continue; // fragment d'exercice : frappes comptées (wpm), mot non journalisé
       const missed = Math.max(0, w.text.length - w.typed.length);
       const timeMs =
         complete && w.startMs !== undefined && w.endMs !== undefined
@@ -375,6 +400,7 @@ export class TestEngine {
     const upto = this.finished ? this.words.length : this.index + 1;
     for (let i = 0; i < upto && i < this.words.length; i++) {
       const w = this.words[i] as TestWord;
+      if (w.noStats) continue; // fragment d'exercice : jamais journalisé
       const committed = w.endMs !== undefined;
       const reached = committed || w.typed.length > 0;
       if (!reached) continue;
@@ -385,6 +411,10 @@ export class TestEngine {
         committed && complete && w.startMs !== undefined
           ? (w.endMs as number) - w.startMs
           : null;
+      // positions fautées de cet essai (1/0 par lettre) : permet de reconstruire
+      // le taux de faute par position depuis le journal, sans agrégat par mot
+      const posErrors: number[] = [];
+      for (let p = 0; p < base.length; p++) posErrors.push(w.posWrong[p] ? 1 : 0);
       out.push({
         text: base,
         index: i,
@@ -392,6 +422,7 @@ export class TestEngine {
         timeMs,
         errors: w.errors + missed,
         correct: w.typed === w.text,
+        posErrors,
         startGapMs: w.startGapMs,
         line: w.line,
         paceD: w.paceD,

@@ -1,4 +1,4 @@
-export type LangId = "fr" | "fr1k" | "fracc" | "en" | "en1k" | "code";
+export type LangId = "fr" | "fr1k" | "fr5k" | "fracc" | "en" | "en1k" | "en5k" | "code";
 
 /** Type de test : par nombre de mots ou par durée (chrono). */
 export type TestKind = "words" | "time";
@@ -11,6 +11,7 @@ export type LetterState = "correct" | "incorrect" | "extra";
 export type TestWord = {
   text: string; // caractères exacts à taper (peut inclure ponctuation/majuscule)
   base?: string; // mot nu du dictionnaire, clé des stats (défaut : text)
+  noStats?: boolean; // fragment d'exercice (ex. bigramme seul) : exclu des stats par mot
   typed: string;
   states: LetterState[];
   errors: number; // frappes fausses (y compris extras) commises dans ce mot
@@ -59,6 +60,7 @@ export type WordAttempt = {
   timeMs: number | null; // temps sur le mot (null si non tapé en entier)
   errors: number; // frappes fausses (+ caractères manqués si le mot a été validé)
   correct: boolean;
+  posErrors?: number[]; // 1 si la position p a été fautée dans cet essai (absent des anciens journaux)
   startGapMs?: number; // délai espace → première lettre (latence de départ)
   line?: boolean; // premier mot d'une ligne visuelle
   paceD?: number; // avance(+)/retard(−) en caractères sur le fantôme à la 1re frappe

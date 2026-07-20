@@ -7,6 +7,7 @@ import {
   exportData,
   importData,
   loadBigramStatsMerged,
+  loadConfusionsMerged,
   loadHistory,
   loadTestLogMulti,
   loadWordStatsTagged,
@@ -17,21 +18,24 @@ import {
   wordErrRate,
   wordPosErrorRates,
   wordOutcomeSpeeds,
+  wordStatsFromLogs,
   wordTrials,
 } from "../store";
 import type { OutcomeSpeed, TaggedWord } from "../store";
+import type { ErrKind } from "../engine";
 import type {
   BigramStat,
   Config,
   HistoryEntry,
   LangId,
+  TestKind,
   TestLog,
   TestMode,
   WordStat,
 } from "../types";
 import { ALL_FAMILIES, FAMILY_LABEL, FAMILY_OF, type LangFamily } from "../lang";
 import { LANGS } from "../wordlist";
-import { practicePool } from "../wordlist";
+import { familyWords, practicePool } from "../wordlist";
 import { el, fmt, fmtPct, toast, wordClasses } from "./common";
 import {
   ACCENT,
@@ -51,11 +55,44 @@ import {
   stats as summary,
 } from "./charts";
 
-/** Couleur fixe par famille de langue pour la coloration « par langue ». */
+/**
+ * Couleur fixe par famille de langue pour la coloration « par langue ».
+ * L'anglais quitte le crème (trop proche de l'or et quasi gris — validé au
+ * script dataviz : ΔE 9 < 15, chroma 0.036) pour une encre framboise (#cf6f92 :
+ * ΔE 23 vs or, 11.7 en vision déficiente, contraste 3:1+ sur la surface).
+ */
 const FAMILY_COLOR: Record<LangFamily, string> = {
   fr: ACCENT,
-  en: PACE,
+  en: "#cf6f92",
   code: STATUS.good,
+};
+
+/**
+ * Couleur fixe par variante : une rampe clair → foncé par famille, la teinte
+ * porte la langue et la profondeur porte la taille du pool (200 → 1k → 5k →
+ * accents). Rampes validées (monotones, pas de foncé illisible sur la surface).
+ */
+const LANG_COLOR: Record<LangId, string> = {
+  fr: "#f4e2a4",
+  fr1k: "#e6c15a",
+  fr5k: "#c09032",
+  fracc: "#9a6f1d",
+  en: "#eeb0c2",
+  en1k: "#cf6f92",
+  en5k: "#9e4b69",
+  code: "#9bb04e",
+};
+
+/** Libellé court d'une variante, pour les pastilles et légendes compactes. */
+const LANG_SHORT: Record<LangId, string> = {
+  fr: "fr 200",
+  fr1k: "fr 1k",
+  fr5k: "fr 5k",
+  fracc: "fr acc",
+  en: "en 200",
+  en1k: "en 1k",
+  en5k: "en 5k",
+  code: "code",
 };
 
 /** Modes filtrables dans l'en-tête — couleurs alignées sur les graphiques. */
@@ -63,6 +100,41 @@ const MODE_FILTERS: { key: TestMode; label: string; color: string }[] = [
   { key: "normal", label: "normal", color: ACCENT },
   { key: "practice", label: "entraînement", color: STATUS.serious },
 ];
+
+// ---------------------------------------------------------------------------
+//  Type de test (mots / durée) : clé, libellé, couleur, tri
+// ---------------------------------------------------------------------------
+/** Clé canonique d'un type de test : `words|25`, `time|30`… (replis anciens inclus). */
+function kindKeyOf(h: { kind?: TestKind; target?: number; wordCount: number }): string {
+  return `${h.kind ?? "words"}|${h.target ?? h.wordCount}`;
+}
+
+function kindLabelOf(key: string): string {
+  const [kind, t] = key.split("|");
+  return kind === "time" ? `${t} s` : `${t} mots`;
+}
+
+/**
+ * Couleur fixe d'un type : rampe or pour les tests aux mots, rampe verte pour
+ * les tests au chrono — plus le test est long, plus la teinte est profonde.
+ * La couleur suit la cible elle-même (seuils fixes), pas son rang dans le filtre.
+ */
+const KIND_STEPS_WORDS = ["#f4e2a4", "#e6c15a", "#c09032"];
+const KIND_STEPS_TIME = ["#cdd98f", "#9bb04e", "#6f8433"];
+function kindColorOf(key: string): string {
+  const [kind, t] = key.split("|");
+  const n = Number(t);
+  if (kind === "time") return KIND_STEPS_TIME[n <= 15 ? 0 : n <= 30 ? 1 : 2]!;
+  return KIND_STEPS_WORDS[n <= 10 ? 0 : n <= 25 ? 1 : 2]!;
+}
+
+/** Tri d'affichage : les tests aux mots d'abord, puis au chrono, par cible croissante. */
+function kindCompare(a: string, b: string): number {
+  const [ka, ta] = a.split("|");
+  const [kb, tb] = b.split("|");
+  if (ka !== kb) return ka === "words" ? -1 : 1;
+  return Number(ta) - Number(tb);
+}
 
 /** Ligne d'analyse par mot, agrégée sur une (famille de langue, mot). */
 type WordRow = {
@@ -103,6 +175,42 @@ function buildWordRows(tagged: TaggedWord[], outcome: Map<string, OutcomeSpeed>)
 }
 
 type Tab = "progression" | "mots" | "biais" | "bigrammes" | "clavier" | "activite";
+
+/** Dimension portée par la couleur des points sur l'onglet Progression. */
+type ColorDim = "mode" | "lang" | "kind";
+type ProgState = { range: number; maWin: number; colorBy: ColorDim };
+
+/** Catégories (clé, libellé, couleur) du nuage de progression selon la dimension choisie. */
+function progCategories(
+  history: HistoryEntry[],
+  dim: ColorDim
+): { cats: { key: string; label: string; color: string }[]; of: (h: HistoryEntry) => string } {
+  if (dim === "lang") {
+    return {
+      cats: ALL_LANGS.filter((l) => history.some((h) => h.lang === l)).map((l) => ({
+        key: l,
+        label: LANG_SHORT[l],
+        color: LANG_COLOR[l],
+      })),
+      of: (h) => h.lang,
+    };
+  }
+  if (dim === "kind") {
+    const present = [...new Set(history.map(kindKeyOf))].sort(kindCompare);
+    return {
+      cats: present.map((k) => ({ key: k, label: kindLabelOf(k), color: kindColorOf(k) })),
+      of: kindKeyOf,
+    };
+  }
+  return {
+    cats: MODE_FILTERS.filter((m) => history.some((h) => h.mode === m.key)).map((m) => ({
+      key: m.key as string,
+      label: m.label,
+      color: m.color,
+    })),
+    of: (h) => h.mode,
+  };
+}
 type SortKey = "word" | "lang" | "attempts" | "wpm" | "okWpm" | "badWpm" | "errRate" | "errors";
 
 const TABS: { key: Tab; label: string }[] = [
@@ -116,72 +224,125 @@ const TABS: { key: Tab; label: string }[] = [
 
 export function mountStatsView(root: HTMLElement, signal: AbortSignal): void {
   const cfg = loadConfig();
-  // état local (n'altère pas la config globale)
-  const selectedFamilies = new Set<LangFamily>(ALL_FAMILIES);
-  const selectedModes = new Set<TestMode>(MODE_FILTERS.map((m) => m.key));
+  // état local (n'altère pas la config globale). Cochés par défaut : les tests
+  // « normal » seulement (les entraînements tirent les courbes vers le bas),
+  // toutes les variantes fr/en (le pool code se coche à la demande), et tous
+  // les types de test rencontrés dans l'historique.
+  const selectedLangs = new Set<LangId>(ALL_LANGS.filter((l) => FAMILY_OF[l] !== "code"));
+  const selectedModes = new Set<TestMode>(["normal"]);
+  // types de test réellement joués (l'historique fait foi) — tous cochés au départ
+  const availableKinds = [...new Set(loadHistory().map(kindKeyOf))].sort(kindCompare);
+  const selectedKinds = new Set<string>(availableKinds);
   let tab: Tab = "progression";
   // état de l'onglet Progression, conservé entre deux re-rendus
-  const progState = { range: 0, maWin: 0 }; // range : 0 = tout · maWin : 0 = auto
+  // range : 0 = tout · maWin : 0 = auto · colorBy : dimension portée par la couleur
+  const progState: ProgState = { range: 0, maWin: 0, colorBy: "lang" };
 
   root.innerHTML = "";
 
   // --- en-tête ---
   const header = el("div", "stats-header");
   header.append(el("h2", "page-title", "Statistiques"));
+  const filtersCol = el("div", "stats-filters");
 
-  // barre de langues (multi-sélection, au moins une active) — une pastille par
-  // famille : fr et fr1k (resp. en et en1k) partagent déjà les mêmes données.
-  const langBar = el("div", "lang-filter");
-  langBar.append(el("span", "lang-filter-label", "Langues"));
-  const familyPills = new Map<LangFamily, HTMLElement>();
-  for (const family of ALL_FAMILIES) {
-    const pill = el("button", "pill on", FAMILY_LABEL[family]);
-    pill.style.setProperty("--lang-dot", FAMILY_COLOR[family]);
-    pill.classList.add("lang-pill");
-    pill.addEventListener(
-      "click",
-      () => {
-        if (selectedFamilies.has(family)) {
-          if (selectedFamilies.size === 1) return; // garde-fou : au moins une famille
-          selectedFamilies.delete(family);
-        } else {
-          selectedFamilies.add(family);
-        }
-        pill.classList.toggle("on", selectedFamilies.has(family));
-        renderTab();
-      },
-      { signal }
-    );
-    familyPills.set(family, pill);
-    langBar.append(pill);
+  /** Fabrique une barre de pastilles multi-sélection avec garde-fou ≥ 1. */
+  function pillBar<K>(
+    label: string,
+    items: { key: K; label: string; color: string; title?: string }[],
+    selected: Set<K>,
+    compact: boolean
+  ): { bar: HTMLElement; sync: () => void } {
+    const bar = el("div", "lang-filter");
+    bar.append(el("span", "lang-filter-label", label));
+    const pills = new Map<K, HTMLElement>();
+    for (const it of items) {
+      const pill = el(
+        "button",
+        "pill lang-pill" + (compact ? " pill-sm" : "") + (selected.has(it.key) ? " on" : ""),
+        it.label
+      );
+      pill.style.setProperty("--lang-dot", it.color);
+      if (it.title) pill.title = it.title;
+      pill.addEventListener(
+        "click",
+        () => {
+          if (selected.has(it.key)) {
+            if (selected.size === 1) return; // garde-fou : au moins une sélection
+            selected.delete(it.key);
+          } else {
+            selected.add(it.key);
+          }
+          pill.classList.toggle("on", selected.has(it.key));
+          renderTab();
+        },
+        { signal }
+      );
+      pills.set(it.key, pill);
+      bar.append(pill);
+    }
+    const sync = (): void => {
+      for (const [key, pill] of pills) pill.classList.toggle("on", selected.has(key));
+    };
+    return { bar, sync };
   }
-  header.append(langBar);
 
-  // barre de modes (multi-sélection, au moins un actif) : les entraînements
-  // ciblés tirent la moyenne vers le bas, on peut donc les écarter d'un clic.
-  // Sans effet sur Mots/Bigrammes (données agrégées tous modes) : masquée là-bas.
-  const modeBar = el("div", "lang-filter");
-  modeBar.append(el("span", "lang-filter-label", "Modes"));
-  for (const m of MODE_FILTERS) {
-    const pill = el("button", "pill on lang-pill", m.label);
-    pill.style.setProperty("--lang-dot", m.color);
-    pill.addEventListener(
-      "click",
-      () => {
-        if (selectedModes.has(m.key)) {
-          if (selectedModes.size === 1) return; // garde-fou : au moins un mode
-          selectedModes.delete(m.key);
-        } else {
-          selectedModes.add(m.key);
-        }
-        pill.classList.toggle("on", selectedModes.has(m.key));
-        renderTab();
-      },
-      { signal }
-    );
-    modeBar.append(pill);
-  }
-  header.append(modeBar);
+  // barre de langues : une pastille par variante (fr 200 / 1k / 5k…) — le
+  // point de couleur suit la rampe de la famille, du clair (petit pool) au foncé.
+  const langBar = pillBar(
+    "Langues",
+    ALL_LANGS.map((l) => ({ key: l, label: LANG_SHORT[l], color: LANG_COLOR[l], title: LANGS[l].label })),
+    selectedLangs,
+    true
+  );
+
+  // barre des types de test (10/25/50 mots, 15/30/60 s…), construite depuis
+  // l'historique : seul lui connaît le type (le journal brut ne le stocke pas),
+  // le filtre s'applique donc à Progression et Activité.
+  const kindBar = pillBar(
+    "Type",
+    availableKinds.map((k) => ({ key: k, label: kindLabelOf(k), color: kindColorOf(k) })),
+    selectedKinds,
+    true
+  );
+
+  // barre de modes : les entraînements ciblés tirent la moyenne vers le bas, on
+  // peut donc les écarter d'un clic. Par défaut seul « normal » est coché. Sur
+  // l'onglet Mots, les stats sont reconstruites depuis le journal selon ce
+  // filtre. Masquée sur Bigrammes seulement (agrégat non filtrable).
+  const modeBar = pillBar(
+    "Modes",
+    MODE_FILTERS.map((m) => ({ key: m.key, label: m.label, color: m.color })),
+    selectedModes,
+    false
+  );
+
+  // bouton « Test actuel » : cale tous les filtres sur la config en cours, pour
+  // lire la courbe du test qu'on est réellement en train de travailler.
+  const cfgKind = cfg.testKind === "time" ? `time|${cfg.duration}` : `words|${cfg.wordCount}`;
+  const currentBtn = el("button", "pill current-test-btn", "◎ Test actuel");
+  currentBtn.title = `Ne garder que ${LANGS[cfg.lang].label} · ${kindLabelOf(cfgKind)} · normal`;
+  currentBtn.addEventListener(
+    "click",
+    () => {
+      selectedLangs.clear();
+      selectedLangs.add(cfg.lang);
+      selectedModes.clear();
+      selectedModes.add("normal");
+      selectedKinds.clear();
+      selectedKinds.add(cfgKind);
+      langBar.sync();
+      kindBar.sync();
+      modeBar.sync();
+      renderTab();
+      toast(`Filtres calés sur ${LANGS[cfg.lang].label} · ${kindLabelOf(cfgKind)} · normal.`);
+    },
+    { signal }
+  );
+
+  const modeRow = el("div", "stats-filter-row");
+  modeRow.append(modeBar.bar, currentBtn);
+  filtersCol.append(langBar.bar, kindBar.bar, modeRow);
+  header.append(filtersCol);
   root.append(header);
 
   // --- barre d'onglets ---
@@ -207,40 +368,52 @@ export function mountStatsView(root: HTMLElement, signal: AbortSignal): void {
 
   function renderTab(): void {
     for (const [key, btn] of tabBtns) btn.classList.toggle("active", key === tab);
-    // le filtre de mode ne s'applique qu'aux données qui gardent le mode
-    modeBar.style.display = tab === "mots" || tab === "bigrammes" ? "none" : "";
+    // le filtre de mode s'applique partout SAUF sur Bigrammes (agrégat non
+    // filtrable par mode) ; sur Mots, il pilote la reconstruction depuis le journal.
+    // Le filtre de type ne vaut que là où l'historique porte les données
+    // (Progression, Activité) : le journal brut ignore le type de test.
+    modeBar.bar.style.display = tab === "bigrammes" ? "none" : "";
+    kindBar.bar.style.display =
+      availableKinds.length > 0 && (tab === "progression" || tab === "activite") ? "" : "none";
     content.innerHTML = "";
-    const families = ALL_FAMILIES.filter((f) => selectedFamilies.has(f));
-    // variantes couvertes (fr+fr1k, en+en1k) : sert au journal brut, qui garde le détail par pool
-    const langs = ALL_LANGS.filter((l) => selectedFamilies.has(FAMILY_OF[l]));
+    const families = ALL_FAMILIES.filter((f) =>
+      ALL_LANGS.some((l) => FAMILY_OF[l] === f && selectedLangs.has(l))
+    );
+    const langs = ALL_LANGS.filter((l) => selectedLangs.has(l));
     const tagged = loadWordStatsTagged(families);
     const history = loadHistory().filter(
-      (h) => selectedFamilies.has(FAMILY_OF[h.lang]) && selectedModes.has(h.mode)
+      (h) =>
+        selectedLangs.has(h.lang) &&
+        selectedModes.has(h.mode) &&
+        (selectedKinds.size === 0 || selectedKinds.has(kindKeyOf(h)))
     );
+    // journal brut au grain variante : les agrégats mot/bigramme restent par
+    // famille, mais tout ce qui vient du journal respecte la sélection fine
+    const logs = loadTestLogMulti(families).filter((t) => selectedLangs.has(t.lang));
 
     switch (tab) {
       case "progression":
         renderProgression(content, cfg, history, tagged, progState, renderTab, signal);
         break;
       case "mots":
-        renderWords(content, cfg, families, tagged, loadTestLogMulti(families), signal);
+        renderWords(content, cfg, families, logs, selectedModes, signal);
         break;
       case "biais":
         renderBias(
           content,
-          loadTestLogMulti(families).filter((t) => selectedModes.has(t.mode)),
+          logs.filter((t) => selectedModes.has(t.mode)),
           langs.length > 1,
           signal
         );
         break;
       case "bigrammes":
-        renderBigrams(content, loadBigramStatsMerged(families));
+        renderBigrams(content, loadBigramStatsMerged(families), loadConfusionsMerged(families));
         break;
       case "clavier":
         renderKeyboard(
           content,
           loadBigramStatsMerged(families),
-          loadTestLogMulti(families).filter((t) => selectedModes.has(t.mode)),
+          logs.filter((t) => selectedModes.has(t.mode)),
           signal
         );
         break;
@@ -260,7 +433,7 @@ function renderProgression(
   cfg: Config,
   fullHistory: HistoryEntry[],
   tagged: TaggedWord[],
-  state: { range: number; maWin: number },
+  state: ProgState,
   rerender: () => void,
   signal: AbortSignal
 ): void {
@@ -319,6 +492,23 @@ function renderProgression(
     filters.append(btn);
   }
 
+  // --- dimension portée par la couleur des points ---
+  filters.append(
+    labeled(
+      "Couleur",
+      segToggle(
+        [
+          { key: "mode", label: "mode" },
+          { key: "lang", label: "langue" },
+          { key: "kind", label: "type" },
+        ],
+        state.colorBy,
+        (k) => { state.colorBy = k as ColorDim; rerender(); },
+        signal
+      )
+    )
+  );
+
   // --- progression wpm (fenêtre de moyenne mobile réglable) ---
   const maxWin = Math.min(200, history.length);
   const autoWin = Math.max(3, Math.round(history.length / 12));
@@ -330,8 +520,18 @@ function renderProgression(
   }
   root.append(filters);
 
-  const progCats = MODE_FILTERS.filter((m) => history.some((h) => h.mode === m.key))
-    .map((m) => ({ key: m.key as string, label: m.label, color: m.color }));
+  const { cats: progCats, of: catOf } = progCategories(history, state.colorBy);
+  const colorOfCat = (k: string): string => progCats.find((c) => c.key === k)?.color ?? ACCENT;
+  // quand la couleur encode autre chose que le mode, l'entraînement reste
+  // repérable : ses points deviennent des anneaux creux (encodage secondaire)
+  const hollowOf = (h: HistoryEntry): boolean => state.colorBy !== "mode" && h.mode === "practice";
+  const extraLegend =
+    state.colorBy !== "mode" && history.some((h) => h.mode === "practice")
+      ? [{ label: "anneau = entraînement", color: PACE, hollow: true }]
+      : [];
+  const tipOf = (h: HistoryEntry): string =>
+    `<span class="t-dim">${fmtDate(h.date)} · ${fmtPct(h.accuracy)} · ${LANG_SHORT[h.lang]} · ` +
+    `${kindLabelOf(kindKeyOf(h))} · ${h.mode === "practice" ? "entraînement" : "normal"}</span>`;
   const progHost = el("div");
   root.append(progHost);
 
@@ -353,7 +553,12 @@ function renderProgression(
     const modeLabel = t.mode === "practice" ? "entraînement" : "normal";
     box.append(
       el("div", "tp-head", `Test #${index + 1}`),
-      el("div", "tp-sub", `${fmtDate(t.date)} · ${fmt(t.wpm)} wpm · ${fmtPct(t.accuracy)} · ${modeLabel}`)
+      el(
+        "div",
+        "tp-sub",
+        `${fmtDate(t.date)} · ${fmt(t.wpm)} wpm · ${fmtPct(t.accuracy)} · ` +
+          `${LANG_SHORT[t.lang]} · ${kindLabelOf(kindKeyOf(t))} · ${modeLabel}`
+      )
     );
     const del = el("button", "btn danger", "🗑 Supprimer ce test");
     del.addEventListener("click", () => {
@@ -396,10 +601,13 @@ function renderProgression(
         subtitle: `${history.length} test(s) · clique un point pour supprimer ce test`,
         points: history.map((h) => ({
           y: h.wpm,
-          category: h.mode,
-          label: `<span class="t-dim">${fmtDate(h.date)} · ${fmtPct(h.accuracy)} · ${h.mode === "practice" ? "entraînement" : "normal"}</span>`,
+          category: catOf(h),
+          hollow: hollowOf(h),
+          label: tipOf(h),
         })),
         categories: progCats,
+        extraLegend,
+        tipFormat: (v) => fmt(v, 2),
         maWindow: win,
         onPick: pickTest,
       })
@@ -435,10 +643,12 @@ function renderProgression(
         subtitle: "écart-type du wpm entre les mots d'un même test (plus bas = plus régulier)",
         points: consistPts.map((h) => ({
           y: h.consistency as number,
-          category: h.mode,
-          label: `<span class="t-dim">${fmtDate(h.date)} · ${h.mode === "practice" ? "entraînement" : "normal"}</span>`,
+          category: catOf(h),
+          hollow: hollowOf(h),
+          label: tipOf(h),
         })),
         categories: progCats,
+        extraLegend,
         yFormat: (v) => "± " + fmt(v),
         maWindow: win,
       })
@@ -448,23 +658,23 @@ function renderProgression(
   // --- vitesse vs précision ---
   const accs = history.map((h) => h.accuracy * 100);
   const r = pearson(wpms, accs);
-  root.append(
-    scatterChart({
+  const speedAccChart = scatterChart({
       title: "Vitesse vs précision",
       subtitle: r !== null ? `corrélation r = ${fmt(r, 2)}` : undefined,
       points: history.map((h) => ({
         x: h.wpm,
         y: h.accuracy * 100,
-        tint: h.mode === "practice" ? STATUS.serious : ACCENT,
-        tip: `<b>${fmt(h.wpm)} wpm</b> · ${fmtPct(h.accuracy)}<br><span class="t-dim">${fmtDate(h.date)}</span>`,
+        tint: colorOfCat(catOf(h)),
+        tip: `<b>${fmt(h.wpm)} wpm</b> · ${fmtPct(h.accuracy)}<br>${tipOf(h)}`,
       })),
       xLabel: "WPM",
       yLabel: "précision (%)",
       yFormat: (v) => fmt(v) + " %",
       trendline: true,
       height: 300,
-    })
-  );
+    });
+  if (progCats.length > 1) speedAccChart.append(legend(progCats));
+  root.append(speedAccChart);
 
   // --- densité ---
   root.append(
@@ -483,48 +693,58 @@ function renderProgression(
 //  Onglet Mots
 // ===========================================================================
 /** Variante « grand pool » de chaque famille — sert d'affichage sans exclure de mots. */
-const WIDE_VARIANT: Record<LangFamily, LangId> = { fr: "fr1k", en: "en1k", code: "code" };
+const WIDE_VARIANT: Record<LangFamily, LangId> = { fr: "fr5k", en: "en5k", code: "code" };
 
 function renderWords(
   root: HTMLElement,
   cfg: Config,
   families: LangFamily[],
-  tagged: TaggedWord[],
-  logs: TestLog[],
+  allLogs: TestLog[],
+  modes: Set<TestMode>,
   signal: AbortSignal
 ): void {
+  const multiFamily = families.length > 1;
+  // stats par mot reconstruites depuis le journal filtré par mode : par défaut
+  // seuls les tests normaux comptent, donc les entraînements ne faussent ni le
+  // taux de faute ni la vitesse (coche « entraînement » en haut pour les inclure).
+  const modeLogs = allLogs.filter((t) => modes.has(t.mode));
+  const tagged = wordStatsFromLogs(modeLogs);
   if (tagged.length === 0) {
-    root.append(el("div", "empty-note", "Aucune donnée de mot — fais quelques tests !"));
+    root.append(
+      el("div", "empty-note", "Aucune donnée de mot pour les modes sélectionnés — fais quelques tests !")
+    );
     return;
   }
-  const outcome = wordOutcomeSpeeds(logs);
+  const outcome = wordOutcomeSpeeds(modeLogs);
   const rows = buildWordRows(tagged, outcome);
-  const multiFamily = families.length > 1;
 
-  // panneau d'évolution d'un mot, rempli au clic sur la carto ou le tableau
-  const timeline = buildWordTimeline(logs, multiFamily, signal);
+  // panneau d'évolution : garde TOUS les modes (points colorés normal/entraînement),
+  // pour voir justement l'effet des entraînements sur un mot suivi en normal.
+  const timeline = buildWordTimeline(allLogs, multiFamily, signal);
 
   // le tableau expose une surbrillance + un clic-mot, câblés à la carto/timeline
   const table = buildWordTable(cfg, rows, multiFamily, (key) => timeline.show(key), signal);
 
+  // clic sur un mot, où qu'il apparaisse : surligne sa ligne et ouvre son
+  // panneau d'évolution (avec le bouton d'entraînement ciblé)
+  const pick = (key: string): void => { table.focus(key); timeline.show(key); };
+
   // --- cartographie interactive ---
-  root.append(
-    buildCartography(cfg, rows, multiFamily, families, (key) => { table.focus(key); timeline.show(key); }, signal)
-  );
+  root.append(buildCartography(cfg, rows, multiFamily, families, pick, signal));
 
   // --- évolution du mot sélectionné (clic sur la carto ci-dessus ou le tableau) ---
   root.append(timeline.box);
 
   // --- vitesse réussite vs échec ---
-  renderOutcomeSpeed(root, rows, multiFamily);
+  renderOutcomeSpeed(root, rows, multiFamily, pick);
 
   // --- top mots à travailler (agrégé sur les familles sélectionnées) ---
   const pool = families
     .flatMap((f) => {
       const rec: Record<string, WordStat> = {};
       for (const r of rows) if (r.family === f) rec[r.word] = r.stat;
-      // on affiche depuis le plus grand pool de la famille pour ne rien exclure
-      return practicePool(WIDE_VARIANT[f], cfg, rec).map((p) => ({ ...p, family: f }));
+      // on affiche sur l'union des pools de la famille pour ne rien exclure
+      return practicePool(WIDE_VARIANT[f], cfg, rec, familyWords(f)).map((p) => ({ ...p, family: f }));
     })
     .sort((a, b) => b.score - a.score)
     .slice(0, 12);
@@ -532,7 +752,7 @@ function renderWords(
     root.append(
       barChart({
         title: "Priorités d'entraînement",
-        subtitle: "score de difficulté (fautes pondérées + lenteur)",
+        subtitle: "score de difficulté (fautes pondérées + lenteur) · clique un mot pour l'entraîner",
         items: pool.map((p) => ({
           label: p.word,
           value: p.score,
@@ -541,6 +761,7 @@ function renderWords(
           sub: `${multiFamily ? FAMILY_LABEL[p.family] + " · " : ""}${p.avgWpm === null ? "—" : fmt(p.avgWpm)} wpm · ${fmtPct(p.errRate)}`,
         })),
         format: (v) => fmt(v, 2),
+        onPick: (i) => { const p = pool[i]; if (p) pick(`${p.family} ${p.word}`); },
       })
     );
   }
@@ -563,7 +784,7 @@ function renderWords(
   }
 
   // --- courbe d'apprentissage : wpm moyen au n-ième essai d'un mot ---
-  const curve = learningCurve(logs);
+  const curve = learningCurve(modeLogs);
   if (curve.some((c) => c.n > 0)) {
     root.append(
       barChart({
@@ -740,22 +961,29 @@ function buildWordTimeline(
     const word = key.slice(sp + 1);
     const trials = wordTrials(logs, family, word);
 
+    // fabrique un bouton de révision à chaque appel (posé près de chaque
+    // graphique, pour rester visible quel que soit l'endroit où on a défilé)
+    const mkDrillBtn = (): HTMLElement => {
+      const btn = el("button", "btn drill-btn", "⚑ Réviser ce mot");
+      btn.title =
+        "Ouvre un entraînement ciblé : des fragments de ce mot de plus en plus longs " +
+        "(2 lettres → moitié → mot entier), répétés surtout là où tu fautes, jusqu'au mot complet";
+      btn.addEventListener(
+        "click",
+        () => {
+          sessionStorage.setItem("ft:drill", JSON.stringify({ lang: WIDE_VARIANT[family], word }));
+          location.hash = "#test";
+        },
+        { signal }
+      );
+      return btn;
+    };
+
     hint.style.display = "none";
     host.innerHTML = "";
     const title = `Évolution de « ${word} »` + (multiFamily ? ` · ${FAMILY_LABEL[family]}` : "");
     const head = el("div", "timeline-head");
-    head.append(el("h3", "section-title", title));
-    const drillBtn = el("button", "btn", "⚑ Réviser ce mot");
-    drillBtn.title = "Ouvre un entraînement qui répète ce mot, de plus en plus espacé";
-    drillBtn.addEventListener(
-      "click",
-      () => {
-        sessionStorage.setItem("ft:drill", JSON.stringify({ lang: WIDE_VARIANT[family], word }));
-        location.hash = "#test";
-      },
-      { signal }
-    );
-    head.append(drillBtn);
+    head.append(el("h3", "section-title", title), mkDrillBtn());
     host.append(head);
 
     if (trials.length < 2) {
@@ -798,7 +1026,8 @@ function buildWordTimeline(
           categories: cats,
           yFormat: (v) => fmt(v) + " wpm",
           maWindow: win,
-        })
+        }),
+        mkDrillBtn()
       );
       charts.append(
         progressionChart({
@@ -812,7 +1041,8 @@ function buildWordTimeline(
           categories: cats,
           yFormat: (v) => fmt(v, 1),
           maWindow: win,
-        })
+        }),
+        mkDrillBtn()
       );
     };
 
@@ -836,7 +1066,12 @@ function buildWordTimeline(
  * Section « vitesse : réussite vs échec ». Croise, par mot, la vitesse quand on
  * le tape juste et la vitesse quand on le tape en entier mais fauté.
  */
-function renderOutcomeSpeed(root: HTMLElement, rows: WordRow[], multiFamily: boolean): void {
+function renderOutcomeSpeed(
+  root: HTMLElement,
+  rows: WordRow[],
+  multiFamily: boolean,
+  onWord: (key: string) => void
+): void {
   const data = rows
     .filter((r) => r.okWpm !== null && r.badWpm !== null && r.okN >= 2 && r.badN >= 1)
     .map((r) => ({ ...r, gap: r.okWpm! - r.badWpm! }));
@@ -886,7 +1121,7 @@ function renderOutcomeSpeed(root: HTMLElement, rows: WordRow[], multiFamily: boo
   root.append(
     barChart({
       title: "Mots les plus pénalisés par l'erreur",
-      subtitle: "écart de vitesse réussite − échec",
+      subtitle: "écart de vitesse réussite − échec · clique un mot pour l'entraîner",
       items: top.map((d) => ({
         label: d.word,
         value: d.gap,
@@ -895,6 +1130,7 @@ function renderOutcomeSpeed(root: HTMLElement, rows: WordRow[], multiFamily: boo
         sub: `${fmt(d.badWpm!)} → ${fmt(d.okWpm!)} wpm`,
       })),
       format: (v) => fmt(v) + " wpm",
+      onPick: (i) => { const d = top[i]; if (d) onWord(d.key); },
     })
   );
 }
@@ -1503,7 +1739,49 @@ function renderBias(root: HTMLElement, logs: TestLog[], showLang: boolean, signa
 // ===========================================================================
 //  Onglet Bigrammes
 // ===========================================================================
-function renderBigrams(root: HTMLElement, bigrams: Record<string, BigramStat>): void {
+/** Libellé lisible d'une nature de faute (voir ErrKind côté moteur). */
+const ERR_KIND_LABEL: Record<ErrKind, string> = {
+  sub: "substitution",
+  trans: "transposition",
+  omis: "omission",
+};
+
+/**
+ * Résume une ventilation par nature de faute en texte court : « substitution »
+ * si un seul type, sinon la liste triée avec les parts (« omission 60 % ·
+ * substitution 40 % »). Les entrées d'avant cette mesure (clé null) tombent en
+ * « type inconnu ».
+ */
+function kindSummary(kinds: Map<ErrKind | "?", number>): string {
+  const entries = [...kinds.entries()].sort((a, b) => b[1] - a[1]);
+  const total = entries.reduce((s, [, v]) => s + v, 0) || 1;
+  const label = (k: ErrKind | "?") => (k === "?" ? "type inconnu" : ERR_KIND_LABEL[k]);
+  if (entries.length === 1) return label(entries[0]![0]);
+  return entries.map(([k, v]) => `${label(k)} ${Math.round((v / total) * 100)} %`).join(" · ");
+}
+
+/** Regroupe des confusions par lettre-clé (tapée ou visée) avec ventilation par nature. */
+function groupConfusions(
+  list: { key: string; kind: ErrKind | null; n: number }[]
+): { key: string; n: number; kinds: Map<ErrKind | "?", number> }[] {
+  const by = new Map<string, { n: number; kinds: Map<ErrKind | "?", number> }>();
+  for (const e of list) {
+    const cur = by.get(e.key) ?? { n: 0, kinds: new Map() };
+    cur.n += e.n;
+    const kk = e.kind ?? "?";
+    cur.kinds.set(kk, (cur.kinds.get(kk) ?? 0) + e.n);
+    by.set(e.key, cur);
+  }
+  return [...by.entries()]
+    .map(([key, agg]) => ({ key, n: agg.n, kinds: agg.kinds }))
+    .sort((a, b) => b.n - a.n);
+}
+
+function renderBigrams(
+  root: HTMLElement,
+  bigrams: Record<string, BigramStat>,
+  confusions: Record<string, number>
+): void {
   const entries = Object.entries(bigrams);
   if (entries.length === 0) {
     root.append(el("div", "empty-note", "Aucune donnée de bigramme — fais quelques tests !"));
@@ -1511,6 +1789,21 @@ function renderBigrams(root: HTMLElement, bigrams: Record<string, BigramStat>): 
   }
 
   const DISP = (ch: string) => (ch === " " ? "␣" : ch);
+
+  // confusions à plat : { prev, expected, typed, kind, n }. La clé stockée est
+  // `${prev}${expected}\t${typed}\t${type}` (voir TestEngine.confusions). Le champ
+  // `type` est absent des données d'avant cette mesure → kind vaut alors null.
+  const confList = Object.entries(confusions).map(([k, n]) => {
+    const parts = k.split("\t");
+    const pair = parts[0] ?? "";
+    return {
+      prev: pair[0] ?? "",
+      expected: pair[1] ?? "",
+      typed: parts[1] ?? "",
+      kind: (parts[2] as ErrKind | undefined) ?? null,
+      n,
+    };
+  });
 
   // --- univers des caractères présents dans les données + poids (fréquence) ---
   const weight = new Map<string, number>();
@@ -1625,6 +1918,99 @@ function renderBigrams(root: HTMLElement, bigrams: Record<string, BigramStat>): 
   toggle.append(mkBtn("gap", "Délai"), mkBtn("error", "Erreurs"));
   root.append(toggle);
 
+  // --- panneau de détail d'un bigramme (confusions), rempli au clic ---
+  const detail = el("div", "carto-block");
+  const detailHint = el(
+    "div",
+    "empty-note",
+    "Clique une case de la matrice (ou une transition fautée) pour voir le détail des confusions : ce que tu as tapé à la place, et les fois où tu l'as tapé par erreur à la place d'autre chose."
+  );
+  detail.append(detailHint);
+  root.append(detail);
+
+  /** Carte d'une direction de confusion ; note si aucune donnée détaillée. */
+  const dirCard = (
+    title: string,
+    subtitle: string,
+    items: { label: string; value: number; sub?: string }[],
+    tint: string
+  ): HTMLElement => {
+    if (items.length === 0) {
+      const card = el("div", "chart-card");
+      card.append(cardHead(title));
+      card.append(el("div", "empty-note", subtitle));
+      return card;
+    }
+    return barChart({
+      title,
+      subtitle,
+      items: items.map((it) => ({ ...it, mono: true, tint })),
+      format: (v) => fmt(v) + "×",
+    });
+  };
+
+  function showDetail(r: string, c: string): void {
+    detailHint.style.display = "none";
+    detail.innerHTML = "";
+    const pair = `${DISP(r)}${DISP(c)}`;
+    detail.append(el("h3", "section-title", `Confusions autour de « ${pair} »`));
+    detail.append(
+      el(
+        "div",
+        "empty-note",
+        "Nature indiquée par confusion : substitution (mauvaise lettre) ou omission " +
+          "(lettre suivante tapée trop tôt). Transposition et insertion — qui ne " +
+          "concernent pas une 2e lettre après une 1re correcte — sont dans le profil " +
+          "d'erreurs de l'onglet Biais."
+      )
+    );
+
+    // Direction A : le bigramme était ATTENDU, la 2e lettre a été mistapée.
+    const bg = bigrams[r + c];
+    const errExpected = bg ? bg.errors : 0;
+    const asExpected = confList.filter((e) => e.prev === r && e.expected === c);
+    const detailedA = asExpected.reduce((s, e) => s + e.n, 0);
+    // regroupé par lettre réellement tapée, avec la nature de la faute (une même
+    // lettre peut être tantôt substitution, tantôt omission selon le mot)
+    const itemsA = groupConfusions(asExpected.map((e) => ({ key: e.typed, kind: e.kind, n: e.n }))).map(
+      (g) => ({
+        label: `${DISP(r)}${DISP(g.key)}`,
+        value: g.n,
+        sub: `${kindSummary(g.kinds)} · ${fmtPct(g.n / Math.max(1, detailedA))}`,
+      })
+    );
+    const subA =
+      errExpected === 0
+        ? "Jamais fauté quand tu devais le taper."
+        : detailedA < errExpected
+        ? `${errExpected} faute(s) — ce que tu as tapé à la place (dont ${errExpected - detailedA} sans détail, tests d'avant cette mesure)`
+        : `${errExpected} faute(s) — ce que tu as tapé à la place`;
+
+    // Direction B : tu as TAPÉ ce bigramme alors que tu visais autre chose.
+    const asTyped = confList.filter((e) => e.prev === r && e.typed === c && e.expected !== c);
+    const totalB = asTyped.reduce((s, e) => s + e.n, 0);
+    // regroupé par bigramme réellement visé, avec la nature de la faute
+    const itemsB = groupConfusions(asTyped.map((e) => ({ key: e.expected, kind: e.kind, n: e.n }))).map(
+      (g) => ({
+        label: `${DISP(r)}${DISP(g.key)}`,
+        value: g.n,
+        sub: `${kindSummary(g.kinds)} · ${fmtPct(g.n / Math.max(1, totalB))}`,
+      })
+    );
+    const subB =
+      totalB === 0
+        ? `Tu n'as jamais tapé « ${pair} » à la place d'un autre bigramme.`
+        : `${totalB} fois — le bigramme que tu visais en réalité`;
+
+    const cols = el("div", "two-cols");
+    cols.append(
+      dirCard(`Tu devais taper « ${pair} »`, subA, itemsA, STATUS.critical),
+      dirCard(`Tu as tapé « ${pair} » par erreur`, subB, itemsB, STATUS.serious)
+    );
+    detail.append(cols);
+    detail.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
   // --- conteneur rebâti à chaque changement (métrique ou sélection) ---
   const dyn = el("div");
   root.append(dyn);
@@ -1680,13 +2066,14 @@ function renderBigrams(root: HTMLElement, bigrams: Record<string, BigramStat>): 
             };
           },
           cornerTip: "Σ — moyenne pondérée des délais sur les caractères affichés (ligne = 1re lettre, colonne = 2e lettre)",
+          onPick: showDetail,
         })
       );
     } else {
       dyn.append(
         heatmap({
           title: "Taux d'erreur par bigramme",
-          subtitle: "2e lettre fausse après une 1re correcte",
+          subtitle: "2e lettre fausse après une 1re correcte · clique une case pour le détail des confusions",
           rows: chars,
           cols: chars,
           hue: STATUS.critical,
@@ -1724,6 +2111,7 @@ function renderBigrams(root: HTMLElement, bigrams: Record<string, BigramStat>): 
             };
           },
           cornerTip: "Σ — taux d'erreur global sur les caractères affichés (ligne = 1re lettre, colonne = 2e lettre)",
+          onPick: showDetail,
         })
       );
     }
@@ -1752,8 +2140,10 @@ function renderBigrams(root: HTMLElement, bigrams: Record<string, BigramStat>): 
       }),
       barChart({
         title: "Transitions les plus fautées",
+        subtitle: "clique une transition pour le détail des confusions",
         items: faulty.map((b) => ({ label: b.key, value: b.rate * 100, mono: true, tint: STATUS.critical, sub: `${b.errors} err.` })),
         format: (v) => fmt(v, 1) + " %",
+        onPick: (i) => { const k = faulty[i]?.key; if (k) showDetail(k[0] as string, k[1] as string); },
       })
     );
     dyn.append(cols);
@@ -1785,8 +2175,10 @@ function renderBigrams(root: HTMLElement, bigrams: Record<string, BigramStat>): 
           }),
           barChart({
             title: "Lettres les plus fautées à démarrer",
+            subtitle: "clique pour le détail des confusions",
             items: startFaulty.map((x) => ({ label: "␣" + x.letter, value: x.rate * 100, mono: true, tint: STATUS.critical, sub: `${x.errors} err.` })),
             format: (v) => fmt(v, 1) + " %",
+            onPick: (i) => { const l = startFaulty[i]?.letter; if (l) showDetail(" ", l); },
           })
         );
         dyn.append(scols);
@@ -2171,16 +2563,21 @@ function renderActivity(root: HTMLElement, history: HistoryEntry[], viewRoot: HT
     const wrap = el("div", "table-scroll");
     const table = el("table", "data");
     const head = el("tr");
-    for (const h of ["date", "mode", "mots", "wpm", "précision"]) {
-      head.append(el("th", h === "date" || h === "mode" ? undefined : "num", h));
+    for (const h of ["date", "langue", "type", "mode", "wpm", "précision"]) {
+      head.append(el("th", h === "wpm" || h === "précision" ? "num" : undefined, h));
     }
     table.append(head);
     for (const entry of [...history].reverse().slice(0, 30)) {
       const tr = el("tr");
+      const tdLang = el("td");
+      const badge = el("span", "lang-badge", LANG_SHORT[entry.lang]);
+      badge.style.setProperty("--lang-dot", LANG_COLOR[entry.lang]);
+      tdLang.append(badge);
       tr.append(
         el("td", undefined, fmtDate(entry.date)),
+        tdLang,
+        el("td", undefined, kindLabelOf(kindKeyOf(entry))),
         el("td", undefined, entry.mode === "practice" ? "⚑ entraînement" : "normal"),
-        el("td", "num", fmt(entry.wordCount)),
         el("td", "num", fmt(entry.wpm)),
         el("td", "num", fmtPct(entry.accuracy))
       );

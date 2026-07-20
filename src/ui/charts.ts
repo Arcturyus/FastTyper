@@ -131,21 +131,33 @@ function styleAxis(g: Selection<SVGGElement, unknown, null, undefined>): void {
 // ===========================================================================
 //  Progression : nuage (normal / entraînement) + moyenne mobile
 // ===========================================================================
-export type SeriesPoint = { y: number; label: string; category: string };
+export type SeriesPoint = { y: number; label: string; category: string; hollow?: boolean };
 
 export function progressionChart(opts: {
   title: string;
   subtitle?: string;
   points: SeriesPoint[];
   categories: { key: string; label: string; color: string }[];
+  /** Entrées de légende supplémentaires (ex. « anneau = entraînement »). */
+  extraLegend?: { label: string; color: string; hollow?: boolean }[];
   yFormat?: (y: number) => string;
+  /** Format du survol (tooltip) ; par défaut identique à `yFormat`. Sert à
+   * afficher plus de précision au survol que sur les axes (ex. 2 décimales). */
+  tipFormat?: (y: number) => string;
   maWindow?: number;
   onPick?: (index: number, event: MouseEvent) => void; // clic sur un point
 }): HTMLElement {
   const yFormat = opts.yFormat ?? ((y) => numFmt(y));
+  const tipFormat = opts.tipFormat ?? yFormat;
   const win = opts.maWindow ?? Math.max(3, Math.round(opts.points.length / 12));
   const c = makeCard(opts.title, opts.subtitle);
-  c.card.append(legend(opts.categories.concat([{ key: "ma", label: `moyenne mobile (${win})`, color: INK }])));
+  c.card.append(
+    legend([
+      ...opts.categories,
+      ...(opts.extraLegend ?? []),
+      { label: `moyenne mobile (${win})`, color: INK },
+    ])
+  );
   const pts = opts.points;
   if (pts.length < 2) return withEmpty(c.card);
 
@@ -177,9 +189,13 @@ export function progressionChart(opts: {
     .attr("d", d3line<number>().x((_, i) => x(i)).y((v) => y(v)).curve(curveMonotoneX)(ma));
 
   const colorOf = (cat: string) => opts.categories.find((k) => k.key === cat)?.color ?? ACCENT;
+  // les points « creux » (anneaux) gardent le mode lisible quand la couleur
+  // encode une autre dimension (langue, type de test)
   svg.append("g").selectAll("circle").data(pts).join("circle")
     .attr("cx", (_, i) => x(i)).attr("cy", (p) => y(p.y)).attr("r", 3.2)
-    .attr("fill", (p) => colorOf(p.category)).attr("stroke", SURFACE).attr("stroke-width", 1);
+    .attr("fill", (p) => (p.hollow ? SURFACE : colorOf(p.category)))
+    .attr("stroke", (p) => (p.hollow ? colorOf(p.category) : SURFACE))
+    .attr("stroke-width", (p) => (p.hollow ? 1.6 : 1));
 
   // survol
   const cross = svg.append("line").attr("y1", m.top).attr("y2", H - m.bottom)
@@ -197,7 +213,7 @@ export function progressionChart(opts: {
       const p = pts[i]!;
       cross.attr("x1", x(i)).attr("x2", x(i)).style("visibility", "visible");
       hi.attr("cx", x(i)).attr("cy", y(p.y)).attr("stroke", colorOf(p.category)).style("visibility", "visible");
-      c.showTip(event, `<b>${yFormat(p.y)}</b> · <span class="t-dim">moy. ${yFormat(ma[i]!)}</span><br>${p.label}`);
+      c.showTip(event, `<b>${tipFormat(p.y)}</b> · <span class="t-dim">moy. ${tipFormat(ma[i]!)}</span><br>${p.label}`);
     })
     .on("mouseleave", () => {
       cross.style("visibility", "hidden");
@@ -476,6 +492,8 @@ export function heatmap(opts: {
   colMargin?: (col: string) => { v: number | null; tip: string };
   marginHeader?: string;
   cornerTip?: string;
+  /** Clic sur une case (ligne, colonne) — rend toute la matrice cliquable. */
+  onPick?: (row: string, col: string) => void;
 }): HTMLElement {
   const c = makeCard(opts.title, opts.subtitle);
   const { rows, cols } = opts;
@@ -520,13 +538,14 @@ export function heatmap(opts: {
     .attr("x", (d) => xs(d.col)! + 1).attr("y", (d) => ys(d.r)! + 1)
     .attr("width", cell - 2).attr("height", cell - 2).attr("rx", 3)
     .attr("fill", (d) => d.v === null ? "#161310" : shade(d.v))
-    .style("cursor", (d) => d.v === null ? "default" : "pointer")
+    .style("cursor", (d) => (opts.onPick ? "pointer" : d.v === null ? "default" : "pointer"))
     .on("mousemove", function (event, d) {
-      if (d.v === null) return;
+      if (d.v === null && !opts.onPick) return;
       select(this).attr("stroke", INK).attr("stroke-width", 1.5);
-      c.showTip(event, opts.tip(d.r, d.col, d.v));
+      if (d.v !== null) c.showTip(event, opts.tip(d.r, d.col, d.v));
     })
-    .on("mouseleave", function () { select(this).attr("stroke", null); c.hideTip(); });
+    .on("mouseleave", function () { select(this).attr("stroke", null); c.hideTip(); })
+    .on("click", (_event, d) => { if (opts.onPick) opts.onPick(d.r, d.col); });
 
   if (hasMargin) {
     const hdr = opts.marginHeader ?? "Σ";
@@ -581,6 +600,7 @@ export function barChart(opts: {
   items: { label: string; value: number; tint?: string; sub?: string; mono?: boolean }[];
   format?: (v: number) => string;
   max?: number;
+  onPick?: (index: number) => void; // clic sur une ligne (rend la barre cliquable)
 }): HTMLElement {
   const format = opts.format ?? ((v) => numFmt(v));
   const c = makeCard(opts.title, opts.subtitle);
@@ -589,9 +609,13 @@ export function barChart(opts: {
 
   const list = document.createElement("div");
   list.className = "bar-list";
-  for (const it of opts.items) {
+  for (const [idx, it] of opts.items.entries()) {
     const row = document.createElement("div");
     row.className = "bar-row";
+    if (opts.onPick) {
+      row.style.cursor = "pointer";
+      row.addEventListener("click", () => opts.onPick!(idx));
+    }
     const lab = document.createElement("span");
     lab.className = "bar-label" + (it.mono ? " mono" : "");
     lab.textContent = it.label;
@@ -715,7 +739,7 @@ export function pearson(xs: number[], ys: number[]): number | null {
 }
 
 // ---- petits composants partagés -------------------------------------------
-export function legend(items: { label: string; color: string }[]): HTMLElement {
+export function legend(items: { label: string; color: string; hollow?: boolean }[]): HTMLElement {
   const box = document.createElement("div");
   box.className = "chart-legend";
   for (const it of items) {
@@ -723,7 +747,12 @@ export function legend(items: { label: string; color: string }[]): HTMLElement {
     chip.className = "leg-item";
     const dot = document.createElement("span");
     dot.className = "leg-dot";
-    dot.style.background = it.color;
+    if (it.hollow) {
+      dot.style.background = "transparent";
+      dot.style.border = `2px solid ${it.color}`;
+    } else {
+      dot.style.background = it.color;
+    }
     chip.append(dot, document.createTextNode(it.label));
     box.append(chip);
   }

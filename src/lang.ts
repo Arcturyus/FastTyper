@@ -10,9 +10,11 @@ export type LangFamily = "fr" | "en" | "code";
 export const FAMILY_OF: Record<LangId, LangFamily> = {
   fr: "fr",
   fr1k: "fr",
+  fr5k: "fr",
   fracc: "fr", // pool accents : partage les stats du français
   en: "en",
   en1k: "en",
+  en5k: "en",
   code: "code",
 };
 

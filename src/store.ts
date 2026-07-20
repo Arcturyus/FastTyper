@@ -15,6 +15,7 @@ import { storage } from "./db";
 // un mot pratiqué dans un pool profite immédiatement à l'autre taille de pool.
 const wordsKey = (lang: LangId) => `ft:words:${FAMILY_OF[lang]}`;
 const bigramsKey = (lang: LangId) => `ft:bigrams:${FAMILY_OF[lang]}`;
+const confusionsKey = (lang: LangId) => `ft:confusions:${FAMILY_OF[lang]}`;
 const testLogKey = (lang: LangId) => `ft:testlog:${FAMILY_OF[lang]}`;
 const HISTORY_KEY = "ft:history";
 const HISTORY_MAX = 500;
@@ -132,6 +133,20 @@ export function loadBigramStats(lang: LangId): Record<string, BigramStat> {
   return read(bigramsKey(lang), {});
 }
 
+/** Confusions : `${bigrammeAttendu}\t${lettreTapée}` → nb (voir TestEngine.confusions). */
+export function loadConfusions(lang: LangId): Record<string, number> {
+  return read(confusionsKey(lang), {});
+}
+
+/** Fusionne les confusions de plusieurs familles de langue. */
+export function loadConfusionsMerged(families: LangFamily[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const family of families) {
+    for (const [k, n] of Object.entries(loadConfusions(family))) out[k] = (out[k] ?? 0) + n;
+  }
+  return out;
+}
+
 export function loadHistory(): HistoryEntry[] {
   return read(HISTORY_KEY, []);
 }
@@ -210,6 +225,50 @@ export function loadWordStatsTagged(families: LangFamily[]): TaggedWord[] {
     }
   }
   return out;
+}
+
+/**
+ * Reconstruit les stats par mot directement depuis le journal brut fourni, sans
+ * passer par les agrégats persistés. Sert à l'onglet Mots : en filtrant les
+ * journaux par mode en amont, on obtient des stats « tests normaux seulement »
+ * (ou tout autre sous-ensemble), rétroactivement sur tout l'historique — un
+ * entraînement ne pollue donc jamais le taux de faute ou la vitesse affichés.
+ * Les `posErrors` proviennent du journal (absents des tests d'avant cette mise à
+ * jour : la répartition par position se reconstruit alors au fil des tests).
+ */
+export function wordStatsFromLogs(logs: TestLog[]): TaggedWord[] {
+  const map = new Map<string, TaggedWord>();
+  for (const t of logs) {
+    const family = FAMILY_OF[t.lang];
+    for (const w of t.words) {
+      const key = `${family} ${w.text}`;
+      let e = map.get(key);
+      if (!e) {
+        e = {
+          family,
+          word: w.text,
+          stat: {
+            attempts: 0, errors: 0, errorAttempts: 0, posErrors: [],
+            timeMs: 0, timedChars: 0, timedAttempts: 0, last: 0,
+          },
+        };
+        map.set(key, e);
+      }
+      const s = e.stat;
+      s.attempts += 1;
+      s.errors += w.errors;
+      if (w.errors > 0) s.errorAttempts += 1;
+      const pe = w.posErrors;
+      if (pe) for (let p = 0; p < pe.length; p++) s.posErrors[p] = (s.posErrors[p] ?? 0) + (pe[p] ?? 0);
+      if (w.timeMs !== null && w.timeMs > 0) {
+        s.timeMs += w.timeMs;
+        s.timedChars += w.len;
+        s.timedAttempts += 1;
+      }
+      if (t.date > s.last) s.last = t.date;
+    }
+  }
+  return [...map.values()];
 }
 
 /** Fusionne les stats de bigrammes de plusieurs familles de langue (clé = transition). */
@@ -308,6 +367,7 @@ export function okWpmByWord(lang: LangId): Map<string, number> {
 export function okWpmMedianByWord(lang: LangId): Map<string, number> {
   const samples = new Map<string, number[]>();
   for (const t of loadTestLog(lang)) {
+    if (t.mode !== "normal") continue; // la coloration reflète tes tests réels
     for (const w of t.words) {
       if (w.timeMs === null || w.timeMs <= 0 || !w.correct) continue;
       const wpm = w.len / 5 / (w.timeMs / 60000);
@@ -382,11 +442,42 @@ export function wordPosErrorRates(s: WordStat, wordLen: number): number[] {
   return rates;
 }
 
-/** Intègre un résultat de test dans les stats persistées */
+/**
+ * Intègre un résultat de test dans les stats persistées. Les agrégats par mot et
+ * par bigramme ne reçoivent QUE les tests en mode normal : un entraînement ne
+ * doit jamais faire baisser (ou monter) artificiellement les stats d'un mot ou
+ * d'une paire — il reste visible via le journal brut (timeline, mode filtrable).
+ * L'historique et les records, eux, gardent tous les modes.
+ */
 export function applyResult(
   result: TestResult,
   bigrams: Map<string, BigramStat>,
+  confusions: Map<string, number>,
   meta?: { kind?: TestKind; target?: number; consistency?: number }
+): void {
+  if (result.mode === "normal") applyAggregates(result, bigrams, confusions);
+
+  const history = loadHistory();
+  history.push({
+    date: result.date,
+    lang: result.lang,
+    mode: result.mode,
+    wordCount: result.wordCount,
+    durationMs: result.durationMs,
+    wpm: result.wpm,
+    accuracy: result.accuracy,
+    kind: meta?.kind,
+    target: meta?.target,
+    consistency: meta?.consistency,
+  });
+  storage.setItem(HISTORY_KEY, JSON.stringify(history.slice(-HISTORY_MAX)));
+}
+
+/** Écrit la contribution d'un test aux agrégats par mot, bigramme et confusion. */
+function applyAggregates(
+  result: TestResult,
+  bigrams: Map<string, BigramStat>,
+  confusions: Map<string, number>
 ): void {
   const stats = loadWordStats(result.lang);
   for (const w of result.words) {
@@ -427,35 +518,51 @@ export function applyResult(
   }
   storage.setItem(bigramsKey(result.lang), JSON.stringify(bg));
 
-  const history = loadHistory();
-  history.push({
-    date: result.date,
-    lang: result.lang,
-    mode: result.mode,
-    wordCount: result.wordCount,
-    durationMs: result.durationMs,
-    wpm: result.wpm,
-    accuracy: result.accuracy,
-    kind: meta?.kind,
-    target: meta?.target,
-    consistency: meta?.consistency,
-  });
-  storage.setItem(
-    HISTORY_KEY,
-    JSON.stringify(history.slice(-HISTORY_MAX))
-  );
+  const conf = loadConfusions(result.lang);
+  for (const [key, n] of confusions) conf[key] = (conf[key] ?? 0) + n;
+  storage.setItem(confusionsKey(result.lang), JSON.stringify(conf));
 }
 
 /**
  * Défait exactement l'intégration d'un test : inverse de {@link applyResult}
  * (stats par mot, bigrammes, historique) et recalcule le record de la config
  * concernée. Le journal brut est retiré à part via {@link removeTestLog}. Sert à
- * la suppression manuelle d'un test qu'on ne veut pas compter.
+ * la suppression manuelle d'un test qu'on ne veut pas compter. Comme
+ * {@link applyResult}, les agrégats par mot/bigramme ne sont touchés que pour
+ * les tests normaux (un entraînement n'y a jamais été ajouté).
  */
 export function revertResult(
   result: TestResult,
   bigrams: Map<string, BigramStat>,
+  confusions: Map<string, number>,
   meta?: { kind?: TestKind; target?: number }
+): void {
+  if (result.mode === "normal") revertAggregates(result, bigrams, confusions);
+
+  // historique : on retire une entrée de même date (identifiant du test)
+  const history = loadHistory();
+  const idx = history.findIndex((h) => h.date === result.date && h.lang === result.lang);
+  if (idx >= 0) {
+    history.splice(idx, 1);
+    storage.setItem(HISTORY_KEY, JSON.stringify(history));
+  }
+
+  // record : le test supprimé le détenait peut-être — on le recalcule depuis
+  // l'historique désormais amputé.
+  recomputeRecord({
+    lang: result.lang,
+    mode: result.mode,
+    kind: meta?.kind,
+    target: meta?.target,
+    wordCount: result.wordCount,
+  });
+}
+
+/** Retire la contribution d'un test des agrégats par mot, bigramme et confusion. */
+function revertAggregates(
+  result: TestResult,
+  bigrams: Map<string, BigramStat>,
+  confusions: Map<string, number>
 ): void {
   const stats = loadWordStats(result.lang);
   for (const w of result.words) {
@@ -491,23 +598,13 @@ export function revertResult(
   }
   storage.setItem(bigramsKey(result.lang), JSON.stringify(bg));
 
-  // historique : on retire une entrée de même date (identifiant du test)
-  const history = loadHistory();
-  const idx = history.findIndex((h) => h.date === result.date && h.lang === result.lang);
-  if (idx >= 0) {
-    history.splice(idx, 1);
-    storage.setItem(HISTORY_KEY, JSON.stringify(history));
+  const conf = loadConfusions(result.lang);
+  for (const [key, n] of confusions) {
+    const cur = (conf[key] ?? 0) - n;
+    if (cur <= 0) delete conf[key];
+    else conf[key] = cur;
   }
-
-  // record : le test supprimé le détenait peut-être — on le recalcule depuis
-  // l'historique désormais amputé.
-  recomputeRecord({
-    lang: result.lang,
-    mode: result.mode,
-    kind: meta?.kind,
-    target: meta?.target,
-    wordCount: result.wordCount,
-  });
+  storage.setItem(confusionsKey(result.lang), JSON.stringify(conf));
 }
 
 /**
@@ -543,22 +640,26 @@ export function deleteHistoricalTest(lang: LangId, date: number): boolean {
     }
   }
   if (best >= 0 && bestDiff <= 5000) {
-    const stats = loadWordStats(lang);
-    for (const w of (log[best] as TestLog).words) {
-      const s = stats[w.text];
-      if (!s) continue;
-      s.attempts -= 1;
-      s.errors = Math.max(0, s.errors - w.errors);
-      if (w.errors > 0) s.errorAttempts = Math.max(0, s.errorAttempts - 1);
-      if (w.timeMs !== null && w.timeMs > 0) {
-        s.timeMs = Math.max(0, s.timeMs - w.timeMs);
-        s.timedChars = Math.max(0, s.timedChars - w.len);
-        s.timedAttempts = Math.max(0, s.timedAttempts - 1);
+    // les agrégats par mot n'ont reçu que les tests normaux : on ne les défait
+    // que pour ceux-là. Le journal, lui, est retiré quel que soit le mode.
+    if (entry.mode === "normal") {
+      const stats = loadWordStats(lang);
+      for (const w of (log[best] as TestLog).words) {
+        const s = stats[w.text];
+        if (!s) continue;
+        s.attempts -= 1;
+        s.errors = Math.max(0, s.errors - w.errors);
+        if (w.errors > 0) s.errorAttempts = Math.max(0, s.errorAttempts - 1);
+        if (w.timeMs !== null && w.timeMs > 0) {
+          s.timeMs = Math.max(0, s.timeMs - w.timeMs);
+          s.timedChars = Math.max(0, s.timedChars - w.len);
+          s.timedAttempts = Math.max(0, s.timedAttempts - 1);
+        }
+        if (s.attempts <= 0) delete stats[w.text];
+        else stats[w.text] = s;
       }
-      if (s.attempts <= 0) delete stats[w.text];
-      else stats[w.text] = s;
+      storage.setItem(wordsKey(lang), JSON.stringify(stats));
     }
-    storage.setItem(wordsKey(lang), JSON.stringify(stats));
     log.splice(best, 1);
     storage.setItem(testLogKey(lang), JSON.stringify(log));
   }
@@ -645,7 +746,7 @@ export function recomputeRecord(m: RecordMeta): void {
   storage.setItem(RECORDS_KEY, JSON.stringify(recs));
 }
 
-export const ALL_LANGS: LangId[] = ["fr", "fr1k", "fracc", "en", "en1k", "code"];
+export const ALL_LANGS: LangId[] = ["fr", "fr1k", "fr5k", "fracc", "en", "en1k", "en5k", "code"];
 
 export function exportData(): string {
   const data: Record<string, unknown> = {
@@ -657,6 +758,7 @@ export function exportData(): string {
   for (const family of ALL_FAMILIES) {
     data[`words:${family}`] = loadWordStats(family);
     data[`bigrams:${family}`] = loadBigramStats(family);
+    data[`confusions:${family}`] = loadConfusions(family);
     data[`testlog:${family}`] = loadTestLog(family);
   }
   return JSON.stringify(data, null, 2);
@@ -687,6 +789,9 @@ export function importData(json: string): void {
       }
       if (data[`bigrams:${family}`]) {
         storage.setItem(bigramsKey(family), JSON.stringify(data[`bigrams:${family}`]));
+      }
+      if (data[`confusions:${family}`]) {
+        storage.setItem(confusionsKey(family), JSON.stringify(data[`confusions:${family}`]));
       }
       if (data[`testlog:${family}`]) {
         storage.setItem(testLogKey(family), JSON.stringify(data[`testlog:${family}`]));
@@ -724,7 +829,7 @@ export function importData(json: string): void {
 export function resetData(): void {
   const keys: string[] = [HISTORY_KEY, RECORDS_KEY];
   for (const family of ALL_FAMILIES) {
-    keys.push(wordsKey(family), bigramsKey(family), testLogKey(family));
+    keys.push(wordsKey(family), bigramsKey(family), confusionsKey(family), testLogKey(family));
   }
   for (const k of keys) storage.removeItem(k);
 }
