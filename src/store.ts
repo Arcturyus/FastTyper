@@ -716,8 +716,9 @@ export function bestRecord(m: RecordMeta): number | null {
 
 /**
  * Enregistre le résultat s'il bat le record de sa configuration. Renvoie true
- * seulement si un record ANTÉRIEUR a été battu (un tout premier test ne compte
- * pas comme « record battu »). À appeler AVANT d'ajouter le test à l'historique.
+ * dès qu'un nouveau record est posé — y compris le tout premier test d'une
+ * configuration (il devient d'office le record). À appeler AVANT d'ajouter le
+ * test à l'historique.
  */
 export function saveRecord(m: RecordMeta, wpm: number, date: number): boolean {
   const recs = loadRecords();
@@ -726,7 +727,7 @@ export function saveRecord(m: RecordMeta, wpm: number, date: number): boolean {
   if (prev && wpm <= prev.wpm) return false;
   recs[k] = { wpm, date };
   storage.setItem(RECORDS_KEY, JSON.stringify(recs));
-  return !!prev; // battu seulement s'il existait déjà un record
+  return true; // record posé (premier test inclus)
 }
 
 /**

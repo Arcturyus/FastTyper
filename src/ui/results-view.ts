@@ -29,7 +29,9 @@ export function renderResults(
 
   // --- bannière nouveau record ---
   if (info.newRecord) {
-    root.append(el("div", "record-banner gold-metal", "🏆 Nouveau record !"));
+    const banner = el("div", "record-banner");
+    banner.append(el("span", "gold-metal", "🏆 Nouveau record !"));
+    root.append(banner);
   }
 
   // --- tuiles ---
