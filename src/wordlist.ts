@@ -274,6 +274,28 @@ export type PracticeCandidate = {
   attempts: number;
 };
 
+// Répétition espacée (à la Anki) : intervalle cible en jours avant qu'un mot
+// travaillé mérite de remonter. L'indice croît avec le nombre d'essais : plus un
+// mot a été vu, plus on espace ses rappels (aujourd'hui → +2 j → +1 sem → …).
+const RECALL_INTERVALS_DAYS = [0, 2, 7, 16, 30];
+
+/**
+ * Facteur de répétition espacée (0.2..1.3) appliqué au score de difficulté. Tant
+ * que l'intervalle cible du mot (croissant avec ses essais) n'est pas écoulé, son
+ * score est atténué : un mot fraîchement revu redescend dans la file et laisse la
+ * place à d'autres. Passé l'échéance il retrouve son plein poids, et un mot
+ * négligé de longue date reçoit un léger bonus de « rappel dû ». S'appuie sur
+ * {@link WordStat.last} (date du dernier essai) — voir répétition espacée.
+ */
+function recallFactor(s: WordStat, now: number): number {
+  const stage = Math.min(s.attempts, RECALL_INTERVALS_DAYS.length - 1);
+  const targetDays = RECALL_INTERVALS_DAYS[stage] ?? 0;
+  if (targetDays <= 0 || s.last <= 0) return 1; // pas d'intervalle (ou date absente) : éligible
+  const due = (now - s.last) / 86400000 / targetDays; // 1 = pile à échéance
+  if (due >= 1) return Math.min(1.3, 1 + (due - 1) * 0.1); // dû, léger bonus si négligé
+  return 0.2 + 0.8 * due; // encore frais : atténué, remonte à l'approche de l'échéance
+}
+
 /** Union des pools d'une famille : tous les mots connus, aucune variante n'exclut l'autre. */
 export function familyWords(family: LangFamily): Set<string> {
   const out = new Set<string>();
@@ -298,6 +320,7 @@ export function practicePool(
   // les stats sont partagées par famille (fr/fr1k, en/en1k) : on ne garde que les
   // mots du pool réellement sélectionné pour cette session.
   const pool = poolOverride ?? new Set(LANGS[lang].words);
+  const now = Date.now();
   const candidates: PracticeCandidate[] = [];
   for (const [word, s] of Object.entries(stats)) {
     if (!pool.has(word)) continue;
@@ -307,12 +330,13 @@ export function practicePool(
     const tooSlow = avg !== null && avg <= cfg.practiceMaxWpm;
     const tooManyErrors = err >= cfg.practiceErrRate;
     if (!tooSlow && !tooManyErrors) continue;
-    // score : les erreurs pèsent plus lourd que la lenteur
+    // score : les erreurs pèsent plus lourd que la lenteur…
     const slowness =
       avg === null ? 0 : Math.max(0, (cfg.practiceMaxWpm - avg) / cfg.practiceMaxWpm);
+    // … puis modulé par la répétition espacée : un mot revu récemment redescend.
     candidates.push({
       word,
-      score: err * 2 + slowness,
+      score: (err * 2 + slowness) * recallFactor(s, now),
       avgWpm: avg,
       errRate: err,
       attempts: s.attempts,

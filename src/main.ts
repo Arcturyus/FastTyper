@@ -4,6 +4,7 @@ import { initStore } from "./store";
 import { mountTestView } from "./ui/test-view";
 import { mountStatsView } from "./ui/stats-view";
 import { mountSettingsView } from "./ui/settings-view";
+import { mountHelp } from "./ui/help";
 
 type Route = "test" | "stats" | "settings";
 
@@ -42,6 +43,7 @@ function render(): void {
 
 initDb().then(() => {
   initStore();
+  mountHelp();
   window.addEventListener("hashchange", render);
   render();
 });

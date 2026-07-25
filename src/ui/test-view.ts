@@ -7,6 +7,7 @@ import {
   bestRecord,
   loadBigramStats,
   loadWordStats,
+  median,
   okWpmMedianByWord,
   paceTargetWpm,
   removeTestLog,
@@ -23,13 +24,14 @@ import {
   generateWordDrill,
   generateWords,
   LANGS,
+  practicePool,
 } from "../wordlist";
-import type { Config, LangId, TestMode, TestWord, WordStat } from "../types";
+import type { Config, LangId, TestMode, TestResult, TestWord, WordStat } from "../types";
 
 // intensité minimale d'un trait de soulignage coloré (pour rester visible)
 const ERR_MARK_FLOOR = 0.28;
-import { el, fmt, speedPercentile, speedShade, toast } from "./common";
-import { renderResults } from "./results-view";
+import { el, fmt, fmtPct, speedPercentile, speedShade, toast } from "./common";
+import { renderResults, type DrillReport } from "./results-view";
 
 const WORD_COUNTS = [10, 25, 50];
 
@@ -61,10 +63,15 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
   const keyDownAt = new Map<string, number>();
   /** mots imposés pour un entraînement lancé depuis l'écran de résultats */
   let forcedPool: string[] | null = null;
+  /** instantané du mot avant une révision ciblée (drill), pour le bilan avant/après */
+  let drillBefore: { word: string; wpm: number | null; errRate: number } | null = null;
 
   root.innerHTML = "";
 
   const controls = el("div", "test-controls");
+  // coach : bandeau discret proposant de réviser les pires mots du moment
+  const coachBar = el("div", "coach-bar");
+  coachBar.hidden = true;
   const liveStats = el("div", "live-stats");
   const wordsWrap = el("div", "words-wrap");
   const wordsEl = el("div", "words");
@@ -114,7 +121,7 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
 
   const testScreen = el("div");
   testScreen.append(
-    controls, liveStats, wordsWrap, speedLegend, practiceLegend, footer, input
+    controls, coachBar, liveStats, wordsWrap, speedLegend, practiceLegend, footer, input
   );
   const resultScreen = el("div");
   resultScreen.hidden = true;
@@ -259,6 +266,40 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     controls.append(paceBtn);
   }
 
+  /**
+   * Coach : bandeau discret listant les pires mots du moment (mêmes « Priorités
+   * d'entraînement » que l'onglet Stats). Un clic sur un mot lance directement sa
+   * révision ciblée. Masqué en entraînement et dès la première frappe.
+   */
+  function renderCoach(): void {
+    coachBar.innerHTML = "";
+    if (mode !== "normal" || engine?.startedAt !== null) {
+      coachBar.hidden = true;
+      return;
+    }
+    const worst = practicePool(cfg.lang, cfg, stats).slice(0, 3);
+    if (worst.length === 0) {
+      coachBar.hidden = true;
+      return;
+    }
+    coachBar.append(el("span", "coach-label", "⚑ À retravailler :"));
+    for (const c of worst) {
+      const chip = el("button", "coach-word", c.word);
+      chip.title =
+        `${c.avgWpm === null ? "—" : fmt(c.avgWpm)} wpm · ${fmtPct(c.errRate)} de fautes` +
+        " — clique pour une révision ciblée de ce mot";
+      chip.addEventListener("click", () => {
+        drillWord = c.word;
+        forcedPool = null;
+        mode = "practice";
+        toast(`Révision de « ${c.word} » : fragments ciblés sur tes fautes, jusqu'au mot complet`);
+        newTest();
+      });
+      coachBar.append(chip);
+    }
+    coachBar.hidden = false;
+  }
+
   /** Nombre de mots à générer (mode durée : marge large pour le flux continu). */
   function targetCount(): number {
     return cfg.testKind === "time" ? Math.max(40, cfg.duration * 3) : cfg.wordCount;
@@ -372,6 +413,18 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     stats = loadWordStats(cfg.lang);
     okSpeeds = okWpmMedianByWord(cfg.lang);
     buildSpeedDist();
+    // instantané « avant » du mot révisé : les stats par mot ne reçoivent pas les
+    // entraînements, donc stats[drillWord] reflète bien l'état d'avant ce drill.
+    if (mode === "practice" && drillWord) {
+      const s = stats[drillWord];
+      drillBefore = {
+        word: drillWord,
+        wpm: s ? wordAvgWpm(s) : null,
+        errRate: s ? wordErrRate(s) : 0,
+      };
+    } else {
+      drillBefore = null;
+    }
     engine = new TestEngine(buildWordList(), cfg.lang, mode);
     logged = false;
     paceWpm =
@@ -387,6 +440,7 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     testScreen.hidden = false;
     renderControls();
     renderFooter();
+    renderCoach();
     renderSpeedLegend();
     renderAllWords();
     updateLive();
@@ -761,8 +815,33 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
           newTest();
         },
       },
-      { newRecord }
+      { newRecord, drill: buildDrillReport(result) }
     );
+  }
+
+  /**
+   * Bilan avant/après d'une révision ciblée (drill) : compare l'état du mot avant
+   * le drill (agrégats, non pollués par les entraînements) à sa vitesse et son
+   * taux de faute pendant ce drill (essais du mot complet). Renvoie null hors
+   * drill ou si aucun essai chronométré du mot complet.
+   */
+  function buildDrillReport(result: TestResult): DrillReport | null {
+    if (!drillBefore) return null;
+    const word = drillBefore.word;
+    const fulls = result.words.filter((w) => w.text === word);
+    if (fulls.length === 0) return null;
+    const wpms = fulls
+      .map((w) => (w.timeMs !== null && w.timeMs > 0 ? w.text.length / 5 / (w.timeMs / 60000) : null))
+      .filter((v): v is number => v !== null);
+    const errAttempts = fulls.filter((w) => w.errors > 0).length;
+    return {
+      word,
+      beforeWpm: drillBefore.wpm,
+      afterWpm: median(wpms),
+      beforeErrRate: drillBefore.errRate,
+      afterErrRate: errAttempts / fulls.length,
+      attempts: fulls.length,
+    };
   }
 
   /** Avance du fantôme (en caractères) à l'instant `now`. */
@@ -785,6 +864,8 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     const now = performance.now();
     const ev = engine.typeChar(ch, now);
     if (ev === "ignore") return;
+    // première frappe : le test démarre, on efface le bandeau coach
+    if (wasIdle && engine.startedAt !== null) coachBar.hidden = true;
     // démarrage du chrono en mode durée, à la première frappe
     if (wasIdle && engine.startedAt !== null && cfg.testKind === "time") {
       timeTimer = window.setTimeout(() => {

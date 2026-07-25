@@ -1,6 +1,6 @@
 import type { TestResult, WordResult } from "../types";
 import { LANGS } from "../wordlist";
-import { el, fmt, speedPercentile, speedShade } from "./common";
+import { el, fmt, fmtPct, speedPercentile, speedShade } from "./common";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -10,8 +10,19 @@ type ResultHandlers = {
   onDelete: () => void;
 };
 
+/** Bilan avant/après d'une révision ciblée d'un mot (drill), rendu tangible. */
+export type DrillReport = {
+  word: string;
+  beforeWpm: number | null;
+  afterWpm: number | null;
+  beforeErrRate: number;
+  afterErrRate: number;
+  attempts: number; // essais du mot complet dans ce drill
+};
+
 type ResultInfo = {
   newRecord: boolean;
+  drill?: DrillReport | null;
 };
 
 function wordWpm(w: WordResult): number | null {
@@ -33,6 +44,9 @@ export function renderResults(
     banner.append(el("span", "gold-metal", "🏆 Nouveau record !"));
     root.append(banner);
   }
+
+  // --- bilan de la révision ciblée (drill) ---
+  if (info.drill) root.append(buildDrillBanner(info.drill));
 
   // --- tuiles ---
   const tiles = el("div", "result-tiles");
@@ -150,6 +164,57 @@ export function renderResults(
   });
   btns.append(del);
   root.append(btns);
+}
+
+/**
+ * Bannière « avant → après » d'une révision ciblée : rend l'effort tangible en
+ * comparant la vitesse et le taux de faute du mot avant le drill à ceux mesurés
+ * pendant. Les variations sont teintées (vert = progrès, rouge = régression).
+ */
+function buildDrillBanner(d: DrillReport): HTMLElement {
+  const banner = el("div", "drill-report");
+  banner.append(el("div", "dr-title", `⚑ Révision de « ${d.word} »`));
+
+  const rows = el("div", "dr-rows");
+
+  // ligne vitesse
+  if (d.afterWpm !== null) {
+    const before = d.beforeWpm;
+    const delta = before !== null ? d.afterWpm - before : null;
+    const dir = delta === null ? "" : delta >= 0.5 ? "up" : delta <= -0.5 ? "down" : "flat";
+    const beforeTxt = before === null ? "—" : fmt(before);
+    const deltaTxt =
+      delta === null ? "" : `${delta >= 0 ? "▲ +" : "▼ "}${fmt(Math.abs(delta), 1)}`;
+    rows.append(
+      drRow("vitesse", `${beforeTxt} → ${fmt(d.afterWpm)} wpm`, deltaTxt, dir)
+    );
+  }
+
+  // ligne fautes (taux d'essais fautés : baisser est un progrès → sens inversé)
+  const eDelta = d.afterErrRate - d.beforeErrRate;
+  const eDir = Math.abs(eDelta) < 0.005 ? "flat" : eDelta < 0 ? "up" : "down";
+  const eDeltaTxt = Math.abs(eDelta) < 0.005 ? "" : `${eDelta < 0 ? "▼ −" : "▲ +"}${fmtPct(Math.abs(eDelta))}`;
+  rows.append(
+    drRow("fautes", `${fmtPct(d.beforeErrRate)} → ${fmtPct(d.afterErrRate)}`, eDeltaTxt, eDir)
+  );
+
+  banner.append(rows);
+  banner.append(
+    el("div", "dr-note", `sur ${fmt(d.attempts)} passage(s) du mot complet dans ce drill`)
+  );
+  return banner;
+}
+
+/** Une ligne du bilan de drill : libellé, valeurs, variation teintée par le sens. */
+function drRow(label: string, values: string, delta: string, dir: string): HTMLElement {
+  const row = el("div", "dr-row");
+  row.append(el("span", "dr-label", label));
+  row.append(el("span", "dr-values", values));
+  if (delta) {
+    const d = el("span", `dr-delta dr-${dir}`, delta);
+    row.append(d);
+  }
+  return row;
 }
 
 /** Courbe WPM net par seconde — série unique, crosshair + tooltip au survol */
