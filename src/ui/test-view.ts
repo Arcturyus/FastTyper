@@ -25,6 +25,8 @@ import {
   generateWords,
   LANGS,
   practicePool,
+  RECALL_STALE_RATIO,
+  type PracticeCandidate,
 } from "../wordlist";
 import type { Config, LangId, TestMode, TestResult, TestWord, WordStat } from "../types";
 
@@ -65,6 +67,8 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
   let forcedPool: string[] | null = null;
   /** instantané du mot avant une révision ciblée (drill), pour le bilan avant/après */
   let drillBefore: { word: string; wpm: number | null; errRate: number } | null = null;
+  /** bandeau coach : la liste « révision espacée » est repliée par défaut */
+  let dueExpanded = false;
 
   root.innerHTML = "";
 
@@ -266,10 +270,32 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     controls.append(paceBtn);
   }
 
+  /** Fabrique un chip de mot cliquable pour le bandeau coach (lance sa révision ciblée). */
+  function coachChip(c: PracticeCandidate, extraClass?: string): HTMLElement {
+    const chip = el("button", extraClass ? `coach-word ${extraClass}` : "coach-word", c.word);
+    chip.title =
+      `${c.avgWpm === null ? "—" : fmt(c.avgWpm)} wpm · ${fmtPct(c.errRate)} de fautes` +
+      " — clique pour une révision ciblée de ce mot";
+    chip.addEventListener("click", () => {
+      drillWord = c.word;
+      forcedPool = null;
+      mode = "practice";
+      toast(`Révision de « ${c.word} » : fragments ciblés sur tes fautes, jusqu'au mot complet`);
+      newTest();
+    });
+    return chip;
+  }
+
   /**
    * Coach : bandeau discret listant les pires mots du moment (mêmes « Priorités
-   * d'entraînement » que l'onglet Stats). Un clic sur un mot lance directement sa
-   * révision ciblée. Masqué en entraînement et dès la première frappe.
+   * d'entraînement » que l'onglet Stats), plus — séparément et toujours visible dès
+   * qu'il y a des mots à travailler — la file de révision espacée : les mots dont
+   * l'intervalle Anki vient d'être atteint depuis leur dernier test normal. Les mots
+   * négligés depuis trop longtemps ({@link RECALL_STALE_RATIO}) en sont exclus : ce
+   * n'est plus une échéance de révision « à point », juste un mot délaissé, qui
+   * reste de toute façon repêché via le classement « à retravailler ». Un clic sur
+   * un mot lance directement sa révision ciblée. Masqué en entraînement et dès la
+   * première frappe.
    */
   function renderCoach(): void {
     coachBar.innerHTML = "";
@@ -277,25 +303,35 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
       coachBar.hidden = true;
       return;
     }
-    const worst = practicePool(cfg.lang, cfg, stats).slice(0, 3);
-    if (worst.length === 0) {
+    const all = practicePool(cfg.lang, cfg, stats, undefined, 200);
+    if (all.length === 0) {
       coachBar.hidden = true;
       return;
     }
+    const worst = all.slice(0, 3);
+    const worstWords = new Set(worst.map((c) => c.word));
+    const due = all.filter(
+      (c) => c.due && c.overdueRatio <= RECALL_STALE_RATIO && !worstWords.has(c.word)
+    );
+
     coachBar.append(el("span", "coach-label", "⚑ À retravailler :"));
-    for (const c of worst) {
-      const chip = el("button", "coach-word", c.word);
-      chip.title =
-        `${c.avgWpm === null ? "—" : fmt(c.avgWpm)} wpm · ${fmtPct(c.errRate)} de fautes` +
-        " — clique pour une révision ciblée de ce mot";
-      chip.addEventListener("click", () => {
-        drillWord = c.word;
-        forcedPool = null;
-        mode = "practice";
-        toast(`Révision de « ${c.word} » : fragments ciblés sur tes fautes, jusqu'au mot complet`);
-        newTest();
-      });
-      coachBar.append(chip);
+    for (const c of worst) coachBar.append(coachChip(c));
+
+    const DUE_SHOWN = 3;
+    coachBar.append(el("span", "coach-label due", "🔁 Révision espacée :"));
+    if (due.length === 0) {
+      coachBar.append(el("span", "coach-empty", "rien pour le moment"));
+    } else {
+      const shown = dueExpanded ? due : due.slice(0, DUE_SHOWN);
+      for (const c of shown) coachBar.append(coachChip(c, "due"));
+      if (due.length > DUE_SHOWN && !dueExpanded) {
+        const more = el("button", "coach-more", `voir plus (+${due.length - DUE_SHOWN})`);
+        more.addEventListener("click", () => {
+          dueExpanded = true;
+          renderCoach();
+        });
+        coachBar.append(more);
+      }
     }
     coachBar.hidden = false;
   }
@@ -413,6 +449,7 @@ export function mountTestView(root: HTMLElement, signal: AbortSignal): void {
     stats = loadWordStats(cfg.lang);
     okSpeeds = okWpmMedianByWord(cfg.lang);
     buildSpeedDist();
+    dueExpanded = false;
     // instantané « avant » du mot révisé : les stats par mot ne reçoivent pas les
     // entraînements, donc stats[drillWord] reflète bien l'état d'avant ce drill.
     if (mode === "practice" && drillWord) {

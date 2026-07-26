@@ -89,27 +89,35 @@ export function bigramDifficulty(b: BigramStat): number {
 
 /**
  * Entraînement ciblé sur tes pires bigrammes : repère les paires de lettres les
- * plus fautées/lentes, puis tire des mots du pool qui les contiennent (pondérés
- * par le nombre de bigrammes difficiles présents). Renvoie null si trop peu de
- * données de bigrammes.
+ * plus fautées/lentes, puis tire des mots du pool qui les contiennent — pondérés
+ * par la difficulté des bigrammes difficiles qu'ils portent. La difficulté de
+ * chaque cible est elle-même modulée par la répétition espacée ({@link
+ * recallFactor}, sur `b.last`) : un bigramme tout juste retravaillé pèse moins
+ * pendant son intervalle de fraîcheur, un bigramme dû (ou négligé) pèse plein
+ * pot — c'est ce facteur qui décide, bien plus que la difficulté brute, quelles
+ * paires reviennent dans le tirage. Renvoie null si trop peu de données.
  */
 export function generateBigramPractice(
   lang: LangId,
   count: number,
   bigrams: Record<string, BigramStat>
 ): string[] | null {
+  const now = Date.now();
   const targets = Object.entries(bigrams)
-    .map(([k, b]) => ({ k, score: bigramDifficulty(b) }))
+    .map(([k, b]) => ({
+      k,
+      score: bigramDifficulty(b) * recallFactor(b.count + b.errors, b.last ?? 0, now) ** 2,
+    }))
     .filter((d) => d.score > 0 && !d.k.includes(" ")) // paires de lettres seulement
     .sort((a, b) => b.score - a.score)
-    .slice(0, 12)
-    .map((d) => d.k);
+    .slice(0, 12);
   if (targets.length === 0) return null;
   const weighted: string[] = [];
   for (const w of LANGS[lang].words) {
     let s = 0;
-    for (const t of targets) if (w.includes(t)) s += 1;
-    for (let i = 0; i < s; i++) weighted.push(w);
+    for (const t of targets) if (w.includes(t.k)) s += t.score;
+    const copies = Math.round(s * 4);
+    for (let i = 0; i < copies; i++) weighted.push(w);
   }
   if (weighted.length === 0) return null;
   return sample(weighted, count);
@@ -272,6 +280,8 @@ export type PracticeCandidate = {
   avgWpm: number | null;
   errRate: number;
   attempts: number;
+  due: boolean; // répétition espacée : intervalle écoulé, prêt à ressortir
+  overdueRatio: number; // 1 = pile à échéance, >1 = en retard, -1 = pas d'intervalle défini
 };
 
 // Répétition espacée (à la Anki) : intervalle cible en jours avant qu'un mot
@@ -280,20 +290,34 @@ export type PracticeCandidate = {
 const RECALL_INTERVALS_DAYS = [0, 2, 7, 16, 30];
 
 /**
- * Facteur de répétition espacée (0.2..1.3) appliqué au score de difficulté. Tant
- * que l'intervalle cible du mot (croissant avec ses essais) n'est pas écoulé, son
- * score est atténué : un mot fraîchement revu redescend dans la file et laisse la
- * place à d'autres. Passé l'échéance il retrouve son plein poids, et un mot
- * négligé de longue date reçoit un léger bonus de « rappel dû ». S'appuie sur
- * {@link WordStat.last} (date du dernier essai) — voir répétition espacée.
+ * Au-delà de ce multiple de l'intervalle cible, un mot dû n'est plus considéré
+ * comme une échéance de révision espacée mais comme simplement délaissé depuis
+ * trop longtemps : il reste éligible à l'entraînement (score de difficulté,
+ * `à retravailler`), mais on ne l'affiche plus dans la file « à réviser
+ * maintenant » pour ne pas la noyer sous des mots abandonnés de longue date.
  */
-function recallFactor(s: WordStat, now: number): number {
-  const stage = Math.min(s.attempts, RECALL_INTERVALS_DAYS.length - 1);
+export const RECALL_STALE_RATIO = 3;
+
+/**
+ * État de répétition espacée d'un mot : `ratio` mesure le retard écoulé par
+ * rapport à l'intervalle cible (1 = pile à échéance, -1 si l'intervalle n'est
+ * pas encore défini) ; `factor` (0.2..1.3) en dérive et module le score de
+ * difficulté — un mot fraîchement revu est atténué, un mot dû retrouve son
+ * plein poids (léger bonus s'il est négligé). S'appuie sur la date du dernier
+ * essai (`WordStat.last` / `BigramStat.last`).
+ */
+function recallState(attempts: number, last: number, now: number): { ratio: number; factor: number } {
+  const stage = Math.min(attempts, RECALL_INTERVALS_DAYS.length - 1);
   const targetDays = RECALL_INTERVALS_DAYS[stage] ?? 0;
-  if (targetDays <= 0 || s.last <= 0) return 1; // pas d'intervalle (ou date absente) : éligible
-  const due = (now - s.last) / 86400000 / targetDays; // 1 = pile à échéance
-  if (due >= 1) return Math.min(1.3, 1 + (due - 1) * 0.1); // dû, léger bonus si négligé
-  return 0.2 + 0.8 * due; // encore frais : atténué, remonte à l'approche de l'échéance
+  if (targetDays <= 0 || last <= 0) return { ratio: -1, factor: 1 }; // pas d'intervalle : éligible
+  const ratio = (now - last) / 86400000 / targetDays; // 1 = pile à échéance
+  const factor =
+    ratio >= 1 ? Math.min(1.3, 1 + (ratio - 1) * 0.1) : 0.2 + 0.8 * ratio;
+  return { ratio, factor };
+}
+
+function recallFactor(attempts: number, last: number, now: number): number {
+  return recallState(attempts, last, now).factor;
 }
 
 /** Union des pools d'une famille : tous les mots connus, aucune variante n'exclut l'autre. */
@@ -310,12 +334,15 @@ export function familyWords(family: LangFamily): Set<string> {
  * triés par un score de "difficulté" (erreurs + lenteur).
  * `poolOverride` élargit le filtre (ex. union des pools d'une famille, pour
  * l'affichage dans Stats) ; par défaut, seul le pool de la langue compte.
+ * `limit` remplace le nombre de candidats renvoyés (par défaut `cfg.practicePoolSize`) —
+ * utile pour repérer tous les mots dus (`due`), pas seulement le top habituel.
  */
 export function practicePool(
   lang: LangId,
   cfg: Config,
   stats: Record<string, WordStat>,
-  poolOverride?: Set<string>
+  poolOverride?: Set<string>,
+  limit: number = cfg.practicePoolSize
 ): PracticeCandidate[] {
   // les stats sont partagées par famille (fr/fr1k, en/en1k) : on ne garde que les
   // mots du pool réellement sélectionné pour cette session.
@@ -334,19 +361,27 @@ export function practicePool(
     const slowness =
       avg === null ? 0 : Math.max(0, (cfg.practiceMaxWpm - avg) / cfg.practiceMaxWpm);
     // … puis modulé par la répétition espacée : un mot revu récemment redescend.
+    const { ratio, factor } = recallState(s.attempts, s.last, now);
     candidates.push({
       word,
-      score: (err * 2 + slowness) * recallFactor(s, now),
+      score: (err * 2 + slowness) * factor,
       avgWpm: avg,
       errRate: err,
       attempts: s.attempts,
+      due: factor >= 1,
+      overdueRatio: ratio,
     });
   }
   candidates.sort((a, b) => b.score - a.score);
-  return candidates.slice(0, cfg.practicePoolSize);
+  return candidates.slice(0, limit);
 }
 
-/** Génère un test d'entraînement pondéré : les pires mots reviennent plus souvent */
+/**
+ * Génère un test d'entraînement pondéré : les pires mots reviennent plus souvent.
+ * Les mots dus (répétition espacée, {@link PracticeCandidate.due}) reçoivent un
+ * fort bonus de tirage — c'est l'échéance qui doit dominer le choix, pas
+ * seulement la difficulté brute.
+ */
 export function generatePractice(
   lang: LangId,
   count: number,
@@ -357,7 +392,8 @@ export function generatePractice(
   if (pool.length === 0) return null;
   const weighted: string[] = [];
   for (const c of pool) {
-    const copies = 1 + Math.min(4, Math.round(c.score * 3));
+    const dueBoost = c.due ? 3 : 1;
+    const copies = 1 + Math.min(4, Math.round(c.score * dueBoost * 3));
     for (let i = 0; i < copies; i++) weighted.push(c.word);
   }
   return sample(weighted, count);

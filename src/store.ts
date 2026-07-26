@@ -514,6 +514,7 @@ function applyAggregates(
     cur.count += b.count;
     cur.gapMs += b.gapMs;
     cur.errors += b.errors;
+    cur.last = result.date;
     bg[key] = cur;
   }
   storage.setItem(bigramsKey(result.lang), JSON.stringify(bg));

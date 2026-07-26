@@ -1186,6 +1186,23 @@ table.data tr.row-focus td {
   background: rgba(230, 193, 90, 0.12);
   box-shadow: 0 0 12px var(--gold-glow);
 }
+.coach-label.due { color: var(--gold); }
+.coach-empty { font-style: italic; opacity: 0.7; }
+.coach-word.due {
+  background: rgba(230, 193, 90, 0.08);
+  border-color: rgba(230, 193, 90, 0.3);
+}
+.coach-more {
+  background: none;
+  border: 1px dashed rgba(230, 193, 90, 0.35);
+  color: var(--muted);
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  transition: color 0.15s, border-color 0.15s;
+}
+.coach-more:hover { color: var(--gold-bright); border-color: var(--gold); }
 
 /* ---------- bilan de la révision ciblée (drill) ---------- */
 .drill-report {

@@ -118,6 +118,7 @@ export type BigramStat = {
   count: number; // transitions correctes mesurées
   gapMs: number; // temps cumulé entre les deux frappes
   errors: number; // deuxième lettre fausse après une première correcte
+  last?: number; // date du dernier test normal l'ayant mis à jour (absent = anciennes données)
 };
 
 export type HistoryEntry = {
