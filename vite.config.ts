@@ -6,6 +6,12 @@ import { defineConfig } from "vite";
 // « remises à zéro ». On fixe donc le même port pour dev et preview, et on
 // échoue franchement plutôt que de glisser silencieusement sur un autre port.
 export default defineConfig({
+  // Chemins relatifs : l'app doit tourner aussi bien à la racine d'un domaine
+  // qu'à la racine d'un sous-chemin (GitHub Pages sert le projet sous
+  // /FastTyper/). Avec `base: "./"`, les assets, le manifeste et le service
+  // worker se résolvent depuis la page courante — aucun chemin absolu « / » à
+  // maintenir en double entre le dev local et la production.
+  base: "./",
   server: { port: 5177, strictPort: true },
   preview: { port: 5177, strictPort: true },
 });

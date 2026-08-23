@@ -7,6 +7,11 @@
  */
 const CACHE = "fasttyper-v1";
 
+// Racine servie par ce worker : « / » en local, « /FastTyper/ » sur GitHub
+// Pages. On la déduit du scope d'enregistrement pour ne coder aucun chemin en
+// dur (voir `base: "./"` dans vite.config.ts).
+const ROOT = new URL("./", self.registration.scope).href;
+
 self.addEventListener("install", () => self.skipWaiting());
 
 self.addEventListener("activate", (event) => {
@@ -32,7 +37,8 @@ self.addEventListener("fetch", (event) => {
         const cached = await caches.match(req);
         if (cached) return cached;
         if (req.mode === "navigate") {
-          const shell = await caches.match("/index.html");
+          const shell =
+            (await caches.match(ROOT)) || (await caches.match(`${ROOT}index.html`));
           if (shell) return shell;
         }
         return Response.error();

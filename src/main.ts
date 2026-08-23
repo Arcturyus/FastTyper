@@ -51,7 +51,10 @@ initDb().then(() => {
 // PWA : installe le service worker pour un fonctionnement hors-ligne
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {
-    navigator.serviceWorker.register("/sw.js").catch(() => {
+    // chemins relatifs au `base` de Vite : marche à la racine d'un domaine
+    // comme sous un sous-chemin (GitHub Pages).
+    const root = import.meta.env.BASE_URL;
+    navigator.serviceWorker.register(`${root}sw.js`, { scope: root }).catch(() => {
       // enregistrement impossible (contexte non sécurisé, etc.) : l'app reste en ligne
     });
   });
