@@ -1,6 +1,6 @@
 # FastTyper
 
-Petit site perso de vitesse de frappe, inspiré de [Monkeytype](https://github.com/monkeytype/monkeytype), centré sur la **progression par mot** : chaque mot tapé alimente des statistiques persistantes (vitesse moyenne, taux d'erreur, bigrammes lents/fautés) qui servent à colorer les mots pendant le test et à générer des entraînements ciblés.
+Petit site perso de vitesse de frappe, inspiré de [Monkeytype](https://github.com/monkeytype/monkeytype). Mais je voulais plus de fonctionnalités  :  entrainements ciblés,  mots les plus fautés, les plus lents, couleurs adaptés à la vitesse par mots, stats sur les lettres et bi lettres les plus fautés ou lentes...
 
 ## Lancer
 
@@ -19,6 +19,8 @@ npm run build    # production dans dist/
 - **Mode entraînement** (⚑) : génère un test à partir des pires mots (seuils configurables), les pires revenant plus souvent. Depuis l'écran de résultats, on peut aussi s'entraîner directement sur les mots ratés du test.
 - **Résultats** : WPM net/brut, précision, courbe WPM par seconde avec survol, détail mot par mot.
 - **Export / import JSON** des données, remise à zéro.
+
+...
 
 ## Structure
 
