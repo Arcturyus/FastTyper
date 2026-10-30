@@ -2,6 +2,8 @@
 
 Petit site perso de vitesse de frappe, inspiré de [Monkeytype](https://github.com/monkeytype/monkeytype). Mais je voulais plus de fonctionnalités  :  entrainements ciblés,  mots les plus fautés, les plus lents, couleurs adaptés à la vitesse par mots, stats sur les lettres et bi lettres les plus fautés ou lentes...
 
+Deploiement sur [https://arcturyus.github.io/FastTyper/](https://arcturyus.github.io/FastTyper/).
+
 ## Lancer
 
 ```bash
